@@ -59,7 +59,6 @@ function loadExtension(responses = {}, state = { status: 200 }) {
 			if (name === "node:fs") return {
 				readFileSync: () => JSON.stringify({
 					zai: { type: "api_key", key: "test" },
-					anthropic: { type: "oauth", access: "test" },
 					"openai-codex": { type: "oauth", access: "test", accountId: "test" },
 				}),
 			};
@@ -121,14 +120,6 @@ test("passed resets keep their time; missing or invalid timestamps show no reset
 
 const codexWindow = duration => ({ limit_window_seconds: duration, used_percent: 25, reset_at: resetAt / 1000 });
 const fixtures = {
-	anthropic: {
-		url: "https://api.anthropic.com/api/oauth/usage",
-		response: {
-			five_hour: { utilization: 25, resets_at: new Date(resetAt).toISOString() },
-			seven_day: { utilization: 40, resets_at: new Date(resetAt).toISOString() },
-		},
-		stamps: ["18:30", "Sun 6 Oct, 18:30"],
-	},
 	"openai-codex": {
 		url: "https://chatgpt.com/backend-api/wham/usage",
 		response: {
@@ -154,9 +145,10 @@ const fixtures = {
 };
 
 async function createFooter(provider, theme, status = 200, projectTrusted = true) {
+	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
 	const state = { status };
-	const extension = loadExtension({ [fixture.url]: fixture.response }, state);
+	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state);
 	const events = new Map();
 	const commands = new Map();
 	const tools = [];
@@ -187,7 +179,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	};
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
-	assert.equal(extension.requests.length, 1);
+	assert.equal(extension.requests.length, fixture ? 1 : 0);
 	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
 }
 
@@ -255,6 +247,14 @@ test("zai: a failed refresh keeps the last good rows and says they are old", asy
 	state.status = 200;
 	await commands.get("usage").handler("", ctx);
 	assert.ok(!plainText(footer).includes("showing last result"), "A good refresh clears the note");
+});
+
+test("providers without a usage endpoint make no request", async () => {
+	for (const provider of ["anthropic", "zai-coding-cn"]) {
+		const { footer, requests } = await createFooter(provider, plainTheme);
+		assert.ok(plainText(footer).includes("no usage endpoint"), provider);
+		assert.equal(requests.length, 0);
+	}
 });
 
 test("built-in tools are re-registered with the user's Pi settings", async () => {

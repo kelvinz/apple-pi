@@ -5,26 +5,27 @@
  *
  * 1. A footer showing the current provider's plan usage
  *    (windows with percent left, a countdown, and the local reset time).
+ *    Codex and Z.ai only: Anthropic does not allow subscription use outside
+ *    its own apps, and zai-coding-cn is the China-only plan.
  * 2. A friendlier replacement for the built-in footer: same data (directory,
  *    branch, session name, tokens, cost, context, model, thinking level,
  *    extension statuses) in plain language.
  * 3. A small "→ using <tool> — <path>" title above each tool block when a path
- *    is available. The built-in call
- *    and result rendering stay in place, so expand/collapse is untouched.
+ *    is available. The built-in call and result rendering stay in place, so
+ *    expand/collapse is untouched.
  * 4. A small italic title above assistant text ("✦ reply") and thinking
  *    ("… thinking") blocks. Display-only; user messages stay untouched.
  * 5. A right-aligned previous-user-message button above the fullscreen editor.
  * 6. Fullscreen copy joins lines that the transcript wrapped at its width, so
  *    a copied paragraph pastes as one line. Intentional breaks stay.
  *
- * Plan data refreshes when the agent finishes a turn, when you change model,
+ * Plan data refreshes when the agent settles, when you change model,
  * and on /usage, but not more than once a minute per provider. Only the
  * provider behind the current model is fetched, because it is the only one the
  * footer shows. The footer re-renders from a live snapshot on every frame.
  *
  * Data sources (same ones oh-my-pi uses):
  *   Z.ai    GET https://api.z.ai/api/monitor/usage/quota/limit
- *   Claude  GET https://api.anthropic.com/api/oauth/usage   (OAuth from /login)
  *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (OAuth from /login)
  */
 import type { ExtensionAPI, ExtensionContext, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -97,8 +98,6 @@ const WARNING_MESSAGES: Record<WarningCategory, string> = {
 // pi provider id -> usage cache key
 const PROVIDER_KEYS: Record<string, string> = {
 	zai: "zai",
-	"zai-coding-cn": "zai",
-	anthropic: "claude",
 	"openai-codex": "codex",
 };
 
@@ -344,13 +343,13 @@ export default function (pi: ExtensionAPI) {
 	// others. A millisecond stamp is past the year 2001; a second stamp is not.
 	const toMs = (v: number | undefined): number | undefined => (v === undefined ? undefined : v > 1e12 ? v : v * 1000);
 
-	// All three sources report percent *used* on a 0-100 scale, verified against
-	// live responses (Codex `used_percent`, Z.ai `percentage`, Anthropic
-	// `utilization`). Values are taken at face value: an earlier version scaled
-	// anything below 1 up by 100x, which rendered 0.4% used as 40% used.
+	// Both sources report percent *used* on a 0-100 scale, verified against live
+	// responses (Codex `used_percent`, Z.ai `percentage`). Values are taken at
+	// face value: an earlier version scaled anything below 1 up by 100x, which
+	// rendered 0.4% used as 40% used.
 	const clampPercent = (v: number): number => Math.min(Math.max(v, 0), 100);
 
-	// Rows carry percent *used* — the native shape of all three APIs. The footer
+	// Rows carry percent *used* — the native shape of both APIs. The footer
 	// reports what is left, so the bar and the number both invert here, and only
 	// here. The source's own precision is preserved rather than rounded to whole
 	// points; two decimals is enough to absorb float noise (100 - 99.6 lands on
@@ -393,8 +392,8 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- fetchers ----------
 
-	// One request shape for all three providers: same timeout, same JSON accept,
-	// and the same two failure notes. A response with no `json` carries a `note`.
+	// One request shape for both providers: same timeout, same JSON accept, and
+	// the same two failure notes. A response with no `json` carries a `note`.
 	async function getJson(url: string, headers: Record<string, string>): Promise<{ json?: any; note?: string }> {
 		const res = await fetch(url, {
 			headers: { accept: "application/json", ...headers },
@@ -446,27 +445,6 @@ export default function (pi: ExtensionAPI) {
 			rows.push({ label, pct: exact ?? num(l?.percentage), resetAt: toMs(num(l?.nextResetTime)), windowSeconds });
 		}
 		return { plan: typeof data.level === "string" ? data.level : undefined, rows };
-	}
-
-	async function fetchClaude(access: string): Promise<ProviderStatus> {
-		const { json, note } = await getJson("https://api.anthropic.com/api/oauth/usage", {
-			authorization: `Bearer ${access}`,
-			accept: "application/json, text/plain, */*",
-			"content-type": "application/json",
-			"anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-			"user-agent": "claude-cli/2.0.14 (external, cli)",
-		});
-		if (!json) return { rows: [], note };
-		const row = (bucket: any, label: string, windowSeconds: number): Row => ({
-			label,
-			windowSeconds,
-			pct: num(bucket?.utilization),
-			resetAt: typeof bucket?.resets_at === "string" ? num(Date.parse(bucket.resets_at)) : undefined,
-		});
-		const rows: Row[] = [];
-		if (json.five_hour) rows.push(row(json.five_hour, "5-hour", 5 * 3600));
-		if (json.seven_day) rows.push(row(json.seven_day, "weekly", 7 * DAY_SECONDS));
-		return { rows };
 	}
 
 	function codexAccountId(token: string): string | undefined {
@@ -530,10 +508,6 @@ export default function (pi: ExtensionAPI) {
 		zai: auth => {
 			const key = auth?.zai?.type === "api_key" ? auth.zai.key : envKey("ZAI_API_KEY");
 			return key ? fetchZai(key) : undefined;
-		},
-		claude: auth => {
-			const cred = auth?.anthropic;
-			return cred?.type === "oauth" && cred.access ? fetchClaude(cred.access) : undefined;
 		},
 		codex: auth => {
 			const cred = auth?.["openai-codex"];

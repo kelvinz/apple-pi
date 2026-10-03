@@ -4,7 +4,7 @@ Personal UI and workflow changes for [Pi](https://github.com/earendil-works/pi).
 
 ## Features
 
-- Provider usage for Claude, Codex, and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. Extra Codex quota windows appear when the provider reports them. A failed refresh keeps the last good numbers and adds a "showing last result" line.
+- Provider usage for Codex and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. Extra Codex quota windows appear when the provider reports them. A failed refresh keeps the last good numbers and adds a "showing last result" line. Other providers show "no usage endpoint".
 - A footer with the directory, Git branch, session name, token use, cost, context use, model, thinking level, and extension status.
 - Small titles above tool calls, assistant replies, and thinking blocks. Built-in tool results and expand/collapse controls stay in place.
 - A **previous message** button above the fullscreen editor.
@@ -40,7 +40,7 @@ After registration, remove any old standalone `~/.pi/agent/extensions/apple-pi.t
 
 ### Provider access
 
-Sign in separately on each computer with Pi's `/login` command for Claude or Codex. Z.ai uses Pi's saved `zai` API key or the `ZAI_API_KEY` environment variable. Only the provider for the active model is queried.
+Sign in separately on each computer with Pi's `/login` command for Codex. Z.ai uses Pi's saved `zai` API key or the `ZAI_API_KEY` environment variable. Only the provider for the active model is queried.
 
 Do not commit or sync Pi credentials, sessions, or machine settings through this repository.
 
@@ -84,7 +84,7 @@ TZ=UTC pnpm test
 
 The tests require Node.js and a global pnpm installation of `@earendil-works/pi-coding-agent`. They use Pi's installed TypeScript compiler and TUI helpers. Credentials and HTTP responses are mocked; the tests make no provider requests.
 
-Tests cover reset formats, midnight, expired and missing timestamps, all three providers, extra Codex quota windows, narrow layouts, styled text, and the automatic fetch gap. They do not verify live provider endpoints or mouse/copy behavior in a terminal. Fullscreen navigation and copy use internal Pi layout fields and may need changes after a Pi update.
+Tests cover reset formats, midnight, expired and missing timestamps, both providers, extra Codex quota windows, narrow layouts, styled text, and the automatic fetch gap. They do not verify live provider endpoints or mouse/copy behavior in a terminal. Fullscreen navigation and copy use internal Pi layout fields and may need changes after a Pi update.
 
 ## Files
 
