@@ -23,15 +23,31 @@ const resetAt = new Date(2030, 9, 6, 18, 30).getTime();
 const now = resetAt - (3 * 3600 + 42 * 60) * 1000;
 const hour = 3600;
 const day = 24 * hour;
+// Set to make the mocked SettingsManager fail, as a locked settings file would.
+const settingsFailure = { on: false };
 
 function loadExtension(responses = {}) {
 	const exports = {};
 	const requests = [];
-	const builtin = () => ({ renderCall() {} });
+	const toolCalls = {};
+	const settingsCalls = [];
 	const piModule = {
 		getAgentDir: () => "/mock-agent",
 		UserMessageComponent: class {},
-		...Object.fromEntries(["Bash", "Edit", "Find", "Grep", "Ls", "PowerShell", "Read", "Write"].map(name => [`create${name}ToolDefinition`, builtin])),
+		SettingsManager: {
+			create: (cwd, agentDir, options) => {
+				settingsCalls.push({ cwd, agentDir, options });
+				if (settingsFailure.on) throw new Error("ELOCKED");
+				return { getImageAutoResize: () => false, getShellCommandPrefix: () => "set -e", getShellPath: () => "/bin/zsh" };
+			},
+		},
+		...Object.fromEntries(["Bash", "Edit", "Find", "Grep", "Ls", "PowerShell", "Read", "Write"].map(name => [
+			`create${name}ToolDefinition`,
+			(cwd, options) => {
+				toolCalls[name.toLowerCase()] = { cwd, options };
+				return { renderCall() {} };
+			},
+		])),
 	};
 	runInNewContext(compiled, {
 		exports,
@@ -59,7 +75,7 @@ function loadExtension(responses = {}) {
 		},
 	});
 	assert.equal(exports.__JITI_ERROR__, undefined, "The extension must compile");
-	return { ...exports, requests };
+	return { ...exports, requests, toolCalls, settingsCalls };
 }
 
 const { formatReset } = loadExtension();
@@ -136,21 +152,25 @@ const fixtures = {
 	},
 };
 
-async function createFooter(provider, theme) {
+async function createFooter(provider, theme, projectTrusted = true) {
 	const fixture = fixtures[provider];
 	const extension = loadExtension({ [fixture.url]: fixture.response });
 	const events = new Map();
+	const tools = [];
 	let footer;
 	extension.default({
 		on: (name, handler) => events.set(name, handler),
-		registerTool() {}, registerCommand() {}, registerMarkdownTransformer() {},
+		registerTool: tool => tools.push(tool),
+		registerCommand() {}, registerMarkdownTransformer() {},
 	});
+	const notices = [];
 	const ctx = {
-		mode: "print", cwd: "/mock", hasUI: false,
+		mode: "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted,
 		model: { id: "test", provider },
 		sessionManager: { getEntries: () => [], getCwd: () => "/mock" },
 		ui: {
 			setWidget() {},
+			notify: (message, level) => notices.push([message, level]),
 			setFooter(factory) {
 				footer = factory({ requestRender() {} }, theme, {
 					getGitBranch: () => undefined,
@@ -163,8 +183,10 @@ async function createFooter(provider, theme) {
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(extension.requests.length, 1);
-	return { footer, fixture, events, ctx, requests: extension.requests };
+	return { footer, fixture, events, ctx, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
 }
+
+const plainTheme = { fg: (_, text) => text, bold: text => text };
 
 for (const provider of Object.keys(fixtures)) {
 	test(`${provider}: provider parsing, extra buckets, and width-safe reset wrapping`, async () => {
@@ -191,3 +213,31 @@ for (const provider of Object.keys(fixtures)) {
 		}
 	});
 }
+
+test("built-in tools are re-registered with the user's Pi settings", async () => {
+	const { tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
+	const toolCalls = JSON.parse(JSON.stringify(realmCalls)); // the mock runs in another vm realm
+	assert.equal(tools.length, 8);
+	assert.deepEqual(toolCalls.bash, { cwd: "/mock", options: { commandPrefix: "set -e", shellPath: "/bin/zsh" } });
+	assert.deepEqual(toolCalls.read, { cwd: "/mock", options: { autoResizeImages: false } });
+	assert.deepEqual(toolCalls.edit, { cwd: "/mock" });
+});
+
+test("project settings reach the built-in tools only when Pi trusts the project", async () => {
+	for (const trusted of [true, false]) {
+		const { settingsCalls } = await createFooter("zai", plainTheme, trusted);
+		assert.deepEqual(JSON.parse(JSON.stringify(settingsCalls)), [{ cwd: "/mock", agentDir: "/mock-agent", options: { projectTrusted: trusted } }]);
+	}
+});
+
+test("a settings read failure warns and still registers the tools without settings", async () => {
+	settingsFailure.on = true;
+	try {
+		const { notices, tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
+		assert.deepEqual(notices, [["apple-pi registration unavailable", "warning"]]);
+		assert.equal(tools.length, 8);
+		assert.deepEqual(JSON.parse(JSON.stringify(realmCalls)).bash, { cwd: "/mock" });
+	} finally {
+		settingsFailure.on = false;
+	}
+});

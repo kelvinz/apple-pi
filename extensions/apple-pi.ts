@@ -38,6 +38,7 @@ import {
 	createReadToolDefinition,
 	createWriteToolDefinition,
 	getAgentDir,
+	SettingsManager,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
@@ -78,7 +79,7 @@ export function formatReset(row: Row, now = Date.now()): string {
 type ProviderStatus = { plan?: string; rows: Row[]; note?: string };
 type WarningCategory = "snapshot" | "footer" | "tool-render" | "registration";
 type BuiltinToolDefinition = ToolDefinition<any, any, any>;
-type BuiltinToolFactory = (cwd: string) => BuiltinToolDefinition;
+type BuiltinToolFactory = (cwd: string, options?: any) => BuiltinToolDefinition;
 type ToolCallRenderer = NonNullable<ToolDefinition["renderCall"]>;
 type ToolCallArgs = Parameters<ToolCallRenderer>[0];
 type ToolCallContext = Parameters<ToolCallRenderer>[2];
@@ -886,6 +887,26 @@ export default function (pi: ExtensionAPI) {
 			: "";
 	}
 
+	// A registered tool replaces Pi's own, so it must be built the way Pi builds
+	// it: with the user's settings. Without them, shellCommandPrefix, shellPath,
+	// and image auto-resize would silently stop applying. Project settings count
+	// only when Pi trusts the project: shellCommandPrefix runs before every
+	// command, so an untrusted repository must not be able to set it.
+	function builtinToolOptions(ctx: ExtensionContext): { read?: object; bash?: object } {
+		try {
+			const projectTrusted = ctx.isProjectTrusted?.() === true;
+			const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted });
+			return {
+				read: { autoResizeImages: settings.getImageAutoResize() },
+				bash: { commandPrefix: settings.getShellCommandPrefix(), shellPath: settings.getShellPath() },
+			};
+		} catch {
+			// A locked or unreadable settings file: the tools still work, without them.
+			reportWarning("registration");
+			return {};
+		}
+	}
+
 	function installToolHeaders(ctx: ExtensionContext): void {
 		// Built-in tools use different TypeBox schemas, so this table keeps one
 		// permissive boundary while the renderer callback uses public ToolDefinition types.
@@ -899,9 +920,10 @@ export default function (pi: ExtensionAPI) {
 			["ls", createLsToolDefinition],
 			["powershell", createPowerShellToolDefinition],
 		];
+		const options = builtinToolOptions(ctx);
 		for (const [name, factory] of factories) {
 			try {
-				const builtin = factory(ctx.cwd);
+				const builtin = factory(ctx.cwd, (options as Record<string, object | undefined>)[name]);
 				pi.registerTool({
 					...builtin,
 					renderCall(args: ToolCallArgs, theme: Theme, context: ToolCallContext) {
