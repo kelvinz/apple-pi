@@ -26,7 +26,8 @@ const day = 24 * hour;
 // Set to make the mocked SettingsManager fail, as a locked settings file would.
 const settingsFailure = { on: false };
 
-function loadExtension(responses = {}) {
+// `state.status` is the HTTP status every mocked request returns; tests change it mid-run.
+function loadExtension(responses = {}, state = { status: 200 }) {
 	const exports = {};
 	const requests = [];
 	const toolCalls = {};
@@ -71,7 +72,7 @@ function loadExtension(responses = {}) {
 		fetch: async url => {
 			requests.push(url);
 			assert.ok(Object.hasOwn(responses, url), `Unexpected HTTP request: ${url}`);
-			return { ok: true, json: async () => responses[url] };
+			return { ok: state.status >= 200 && state.status < 300, status: state.status, json: async () => responses[url] };
 		},
 	});
 	assert.equal(exports.__JITI_ERROR__, undefined, "The extension must compile");
@@ -152,16 +153,19 @@ const fixtures = {
 	},
 };
 
-async function createFooter(provider, theme, projectTrusted = true) {
+async function createFooter(provider, theme, status = 200, projectTrusted = true) {
 	const fixture = fixtures[provider];
-	const extension = loadExtension({ [fixture.url]: fixture.response });
+	const state = { status };
+	const extension = loadExtension({ [fixture.url]: fixture.response }, state);
 	const events = new Map();
+	const commands = new Map();
 	const tools = [];
 	let footer;
 	extension.default({
 		on: (name, handler) => events.set(name, handler),
 		registerTool: tool => tools.push(tool),
-		registerCommand() {}, registerMarkdownTransformer() {},
+		registerCommand: (name, command) => commands.set(name, command),
+		registerMarkdownTransformer() {},
 	});
 	const notices = [];
 	const ctx = {
@@ -183,10 +187,11 @@ async function createFooter(provider, theme, projectTrusted = true) {
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(extension.requests.length, 1);
-	return { footer, fixture, events, ctx, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
+	return { footer, fixture, events, commands, ctx, state, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
+const plainText = footer => footer.render(240).map(tui.stripTerminalSequences).join(" ");
 
 for (const provider of Object.keys(fixtures)) {
 	test(`${provider}: provider parsing, extra buckets, and width-safe reset wrapping`, async () => {
@@ -212,7 +217,44 @@ for (const provider of Object.keys(fixtures)) {
 			assert.equal(requests.length, 1, "The existing one-minute fetch gap stays in place");
 		}
 	});
+
+	test(`${provider}: expired-token notes keep the complete login command on narrow terminals`, async () => {
+		for (const styled of [false, true]) {
+			const theme = {
+				fg: (_, text) => styled ? `\x1b[34m${text}\x1b[39m` : text,
+				bold: text => text,
+			};
+			const { footer } = await createFooter(provider, theme, 401);
+			for (const width of [16, 20, 24, 32, 40, 60, 120]) {
+				const lines = footer.render(width);
+				const plain = lines.map(tui.stripTerminalSequences);
+				assert.ok(lines.every(line => tui.visibleWidth(line) <= width), `Overflow at width ${width}`);
+				assert.ok(plain.some(line => line.includes("/login")), `Missing complete /login command at width ${width}`);
+				assert.ok(plain.join(" ").replace(/\s+/g, " ").includes("token expired"), `Missing reason at width ${width}`);
+			}
+		}
+	});
 }
+
+test("zai: a failed refresh keeps the last good rows and says they are old", async () => {
+	const { footer, commands, ctx, state } = await createFooter("zai", plainTheme);
+	assert.ok(plainText(footer).includes("100% left"));
+	state.status = 500;
+	await commands.get("usage").handler("", ctx);
+	const text = plainText(footer);
+	assert.ok(text.includes("100% left"), "The last good rows stay");
+	assert.ok(text.includes("showing last result · error 500"));
+	state.status = 401;
+	await commands.get("usage").handler("", ctx);
+	for (const width of [20, 32, 60]) {
+		const lines = footer.render(width);
+		assert.ok(lines.every(line => tui.visibleWidth(line) <= width), `Overflow at width ${width}`);
+		assert.ok(lines.map(tui.stripTerminalSequences).some(line => line.includes("/login")), `Missing /login at width ${width}`);
+	}
+	state.status = 200;
+	await commands.get("usage").handler("", ctx);
+	assert.ok(!plainText(footer).includes("showing last result"), "A good refresh clears the note");
+});
 
 test("built-in tools are re-registered with the user's Pi settings", async () => {
 	const { tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
@@ -225,7 +267,7 @@ test("built-in tools are re-registered with the user's Pi settings", async () =>
 
 test("project settings reach the built-in tools only when Pi trusts the project", async () => {
 	for (const trusted of [true, false]) {
-		const { settingsCalls } = await createFooter("zai", plainTheme, trusted);
+		const { settingsCalls } = await createFooter("zai", plainTheme, 200, trusted);
 		assert.deepEqual(JSON.parse(JSON.stringify(settingsCalls)), [{ cwd: "/mock", agentDir: "/mock-agent", options: { projectTrusted: trusted } }]);
 	}
 });

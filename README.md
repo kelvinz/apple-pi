@@ -4,7 +4,7 @@ Personal UI and workflow changes for [Pi](https://github.com/earendil-works/pi).
 
 ## Features
 
-- Provider usage for Claude, Codex, and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. Extra Codex quota windows appear when the provider reports them.
+- Provider usage for Claude, Codex, and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. Extra Codex quota windows appear when the provider reports them. A failed refresh keeps the last good numbers and adds a "showing last result" line.
 - A footer with the directory, Git branch, session name, token use, cost, context use, model, thinking level, and extension status.
 - Small titles above tool calls, assistant replies, and thinking blocks. Built-in tool results and expand/collapse controls stay in place.
 - A **previous message** button above the fullscreen editor.

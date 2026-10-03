@@ -47,6 +47,7 @@ import { join, sep } from "node:path";
 
 const MIN_FETCH_GAP_MS = 60 * 1000;
 const FETCH_TIMEOUT_MS = 8 * 1000;
+const TOKEN_EXPIRED_NOTE = "token expired — run /login";
 const BAR_WIDTH = 10;
 // Built once: the footer re-renders on every frame, and building a formatter
 // per row per frame is the most expensive thing on that path.
@@ -76,7 +77,8 @@ export function formatReset(row: Row, now = Date.now()): string {
 	return `resets ${text} (${stamp})`;
 }
 
-type ProviderStatus = { plan?: string; rows: Row[]; note?: string };
+// `stale` marks rows kept from an earlier fetch after a refresh failed.
+type ProviderStatus = { plan?: string; rows: Row[]; note?: string; stale?: string };
 type WarningCategory = "snapshot" | "footer" | "tool-render" | "registration";
 type BuiltinToolDefinition = ToolDefinition<any, any, any>;
 type BuiltinToolFactory = (cwd: string, options?: any) => BuiltinToolDefinition;
@@ -398,7 +400,7 @@ export default function (pi: ExtensionAPI) {
 			headers: { accept: "application/json", ...headers },
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		});
-		if (!res.ok) return { note: res.status === 401 ? "token expired — run /login" : `error ${res.status}` };
+		if (!res.ok) return { note: res.status === 401 ? TOKEN_EXPIRED_NOTE : `error ${res.status}` };
 		return { json: await res.json() };
 	}
 
@@ -554,14 +556,21 @@ export default function (pi: ExtensionAPI) {
 		if (inFlight.has(key)) return false;
 		if (!force && Date.now() - (lastFetch.get(key) ?? 0) < MIN_FETCH_GAP_MS) return false;
 		inFlight.add(key);
+		let next: ProviderStatus;
+		let failed = false;
 		try {
 			const job = PROVIDERS[key]?.(readAuth());
-			cache.set(key, job ? await job : { rows: [], note: "not set up" });
+			next = job ? await job : { rows: [], note: "not set up" };
+			failed = job !== undefined && next.rows.length === 0 && next.note !== undefined;
 		} catch (e) {
-			cache.set(key, { rows: [], note: errText(e) });
+			next = { rows: [], note: errText(e) };
+			failed = true;
 		} finally {
 			inFlight.delete(key);
 		}
+		// A blip must not erase the last good numbers: keep them, say they are old.
+		const prev = cache.get(key);
+		cache.set(key, failed && prev?.rows.length ? { ...prev, stale: next.note } : next);
 		lastFetch.set(key, Date.now());
 		requestRender();
 		return true;
@@ -610,9 +619,12 @@ export default function (pi: ExtensionAPI) {
 	function usageLines(theme: Theme, width: number, providerLabel: string): string[] {
 		if (width <= 0) return [];
 		const { fg, bold } = themeText(theme);
-		// Notes are provider text or a failed request's message, so their length is
-		// not ours to choose. Cut them, or a long one overflows the column.
-		const noteLine = (name: string, text: string): string[] => [truncate(`${fg("accent", name)}  ${fg("muted", text)}`, width)];
+		// Wrap notes that carry the login hint so its command stays complete. External notes
+		// still truncate, so an unbounded error cannot fill the whole footer.
+		const noteLine = (name: string, text: string): string[] => {
+			const line = `${fg("accent", name)}  ${fg("muted", text)}`;
+			return text.includes(TOKEN_EXPIRED_NOTE) ? wrapTextWithAnsi(line, width) : [truncate(line, width)];
+		};
 
 		// Only show the plan that matches the model in use. Providers with no usage
 		// endpoint wired up (opencode, say) get a note, so a missing row is never
@@ -667,6 +679,7 @@ export default function (pi: ExtensionAPI) {
 				lines.push(...wrapTextWithAnsi(resetText, width - visibleWidth(resetIndent)).map(line => resetIndent + line));
 			}
 		});
+		if (status.stale) lines.push(...noteLine(key, `showing last result · ${plainFooterText(status.stale)}`));
 		return lines;
 	}
 
