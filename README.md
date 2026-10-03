@@ -9,6 +9,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 - Small titles above tool calls, assistant replies, and thinking blocks. Built-in tool results and expand/collapse controls stay in place.
 - A **previous message** button above the fullscreen editor.
 - Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks.
+- Automatic continuation after a subscription usage limit resets, with messages added while waiting included on resume. No settings or enable command.
 
 Reset times use the computer's local time zone and a 24-hour clock:
 
@@ -92,6 +93,18 @@ Then run `/reload` in Pi. Commit and push before switching computers. If `git pu
 
 `pi update --extensions` does not pull this working repository; `git pull` is the update path.
 
+## Automatic resume
+
+In long-lived Pi terminal and RPC sessions, a finalized assistant usage-limit error automatically schedules `continue` for the reset time plus one minute. Pi's own retries finish first. There is nothing to configure or turn on.
+
+The footer shows `Auto-resume at …`. You can keep submitting messages while it waits: they appear in the transcript as `apple-pi-queued` entries, including attached images, without starting another model request or changing the deadline. Pi sends these entries to the provider as user messages when the thread continues. Ordinary slash commands still work normally; they are not queued by this feature.
+
+The reset is taken from the error's retry hint and fresh provider usage. If both main 5-hour and weekly windows are exhausted, the later reset wins. Stale usage and unrelated extra quota buckets cannot postpone the retry. If neither the error nor the endpoint supplies a trustworthy reset time, it retries after 15 minutes, then 30, then at most once an hour until a new limit error supplies better information. Authentication/network errors, ordinary HTTP 429s, and successful replies mentioning limits do not activate it.
+
+**There are no crons or background jobs.** Only the running Pi session owns the timer. Closing/exiting Pi, replacing the thread, or `/reload` clears it; reopening a thread does not restore an old timer. Changing the model or navigating to another branch also clears it. Messages already added to the transcript remain saved. Detaching from Herdr is different from closing Pi: if the remote Pi process stays alive, it will still resume.
+
+Pi must stay running, and the timer waits for Pi to be idle and for extension approval/question dialogs to close. The resumed agent uses your existing tool permissions and may continue executing tools unattended. One-shot print/JSON runs do not schedule continuations.
+
 ## Usage and checks
 
 The footer fetches usage at session start. It also refreshes after the agent settles and when the model changes, at most once a minute per provider. `/usage` forces a refresh. The countdown is recalculated on every footer render; there is no separate timer.
@@ -105,13 +118,14 @@ TZ=America/New_York pnpm test
 TZ=UTC pnpm test
 ```
 
-The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, tool registration with Pi's settings, and the copy reflow rules.
+The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, tool registration with Pi's settings, and the copy reflow rules. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
 
-They do not cover live provider endpoints or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
+They do not cover live provider endpoints, live auto-resume behavior, or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
 
 1. For Codex and Z.ai, select the model and run `/usage`. Compare the percentage left and reset time with the provider's usage page.
 2. In fullscreen mode, select a paragraph that wraps across several lines and paste it into another app. Done when the paragraph has no extra line breaks and intentional paragraph breaks remain.
 3. Scroll past an earlier user message and click **previous message**. Done when it returns you to that message.
+4. When a real subscription limit occurs, check the auto-resume time, submit another message, and verify it is shown as queued without another provider request. Done when Pi continues once after the deadline with that message in context. Separately close/reload a waiting session and confirm no old continuation fires.
 
 Raw provider responses and clipboard contents stay out of Git. A provider with no login is untested, not a failed check.
 

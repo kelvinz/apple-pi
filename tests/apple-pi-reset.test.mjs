@@ -33,7 +33,7 @@ const day = 24 * hour;
 const settingsFailure = { on: false };
 
 // `state.status` is the HTTP status every mocked request returns; tests change it mid-run.
-function loadExtension(responses = {}, state = { status: 200 }) {
+function loadExtension(responses = {}, state = { status: 200 }, clock = {}) {
 	const exports = {};
 	const requests = [];
 	const toolCalls = {};
@@ -71,8 +71,10 @@ function loadExtension(responses = {}, state = { status: 200 }) {
 			if (name === "node:path") return requirePi(name);
 			throw new Error(`Unexpected import: ${name}`);
 		},
-		Date: class extends Date { static now() { return now; } },
+		Date: class extends Date { static now() { return clock.now?.() ?? now; } },
 		Intl, Buffer, AbortSignal, setImmediate,
+		setTimeout: clock.setTimeout ?? setTimeout,
+		clearTimeout: clock.clearTimeout ?? clearTimeout,
 		process: { env: {} },
 		fetch: async url => {
 			requests.push(url);
@@ -150,35 +152,46 @@ const fixtures = {
 	},
 };
 
-async function createFooter(provider, theme, status = 200, projectTrusted = true) {
+async function createFooter(provider, theme, status = 200, projectTrusted = true, options = {}) {
 	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
 	const state = { status };
-	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state);
+	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state, options.clock);
 	const events = new Map();
 	const commands = new Map();
 	const tools = [];
+	const prompts = [];
+	const entries = [];
+	const statuses = new Map();
 	let footer;
 	extension.default({
-		on: (name, handler) => events.set(name, handler),
+		on: (name, handler) => {
+			const previous = events.get(name);
+			events.set(name, previous ? async (...args) => {
+				const result = await previous(...args);
+				return await handler(...args) ?? result;
+			} : handler);
+		},
 		registerTool: tool => tools.push(tool),
 		registerCommand: (name, command) => commands.set(name, command),
 		registerMarkdownTransformer() {},
+		sendUserMessage: text => prompts.push(text),
+		sendMessage: message => entries.push({ type: "custom_message", ...asPlain(message) }),
 	});
-	const entries = [];
 	const notices = [];
 	const ctx = {
-		mode: "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted,
+		mode: options.mode ?? "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted, isIdle: () => true,
 		model: { id: "test", provider },
-		sessionManager: { getEntries: () => entries, getCwd: () => "/mock" },
+		sessionManager: { getEntries: () => entries, getCwd: () => "/mock", getSessionId: () => "footer-thread" },
 		ui: {
 			setWidget() {},
+			setStatus: (key, value) => value === undefined ? statuses.delete(key) : statuses.set(key, value),
 			notify: (message, level) => notices.push([message, level]),
 			setFooter(factory) {
 				footer = factory({ requestRender() {} }, theme, {
 					getGitBranch: () => undefined,
 					getAvailableProviderCount: () => 1,
-					getExtensionStatuses: () => new Map(),
+					getExtensionStatuses: () => statuses,
 				});
 			},
 		},
@@ -186,7 +199,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(extension.requests.length, fixture ? 1 : 0);
-	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
+	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, prompts, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
@@ -333,4 +346,266 @@ test("reflow strips transcript padding, accepts CRLF, and handles a selection th
 test("reflow keeps a new list item after a mid-row selection, and indented rows apart", () => {
 	assert.equal(reflowText("bbbb cccc dddd eeee\n- ffff", 20, 1, 6), "bbbb cccc dddd eeee\n- ffff");
 	assert.equal(reflowText("  aaaa bbbb cccc dd\n  eeee", 20), "  aaaa bbbb cccc dd\n  eeee");
+});
+
+const quotaError = "You have hit your ChatGPT usage limit (plus plan). Try again in ~22 min.";
+const asPlain = value => JSON.parse(JSON.stringify(value));
+
+async function createAutoResume(t, options = {}) {
+	let time = now;
+	let id = "thread-1";
+	let idle = true;
+	const timers = new Set();
+	const clock = {
+		now: () => time,
+		setTimeout(fn, delay) {
+			assert.ok(delay > 0 && delay <= 60_000, "Timers must be short chunks, even for weekly limits");
+			const timer = { fn, due: time + delay, unref() { this.unreferenced = true; } };
+			timers.add(timer);
+			return timer;
+		},
+		clearTimeout: timer => timers.delete(timer),
+	};
+	const extension = loadExtension({}, { status: 200 }, clock);
+	const events = new Map();
+	const prompts = [];
+	const messages = [];
+	const statuses = new Map();
+	const ctx = {
+		mode: options.mode ?? "tui", hasUI: true,
+		model: { provider: "openai-codex", id: "test" },
+		sessionManager: { getSessionId: () => id },
+		isIdle: () => idle,
+		ui: { setStatus: (key, value) => statuses.set(key, value), notify() {} },
+	};
+	const pi = {
+		on: (event, handler) => events.set(event, handler),
+		sendUserMessage: text => prompts.push(text),
+		sendMessage: (message, delivery) => messages.push(asPlain({ message, delivery })),
+	};
+	extension.installAutoResume(pi, options.freshUsage ?? (async () => options.usage));
+	const emit = (event, data = {}) => events.get(event)?.(data, ctx);
+	await emit("session_start");
+	t.after(() => emit("session_shutdown"));
+	return {
+		...extension, ctx, timers, prompts, messages, statuses, emit,
+		setIdle: value => { idle = value; },
+		setSessionId: value => { id = value; },
+		error: (errorMessage = quotaError, stopReason = "error") => emit("message_end", { message: { role: "assistant", stopReason, errorMessage } }),
+		input: (text, images) => emit("input", { text, images, source: "interactive" }),
+		jump(ms) {
+			time += ms;
+			// Simulate sleep/wake: overdue callbacks see the actual wall clock,
+			// not a reconstructed sequence of thousands of elapsed minute ticks.
+			for (const timer of [...timers]) {
+				if (timer.due <= time) { timers.delete(timer); timer.fn(); }
+			}
+		},
+	};
+}
+
+test("auto-resume: retry hints accept minutes, compound durations, zero, and reject absent/invalid hints", () => {
+	const { usageRetryAt, isUsageLimit } = loadExtension();
+	assert.equal(usageRetryAt(quotaError, now), now + 22 * 60_000);
+	assert.equal(usageRetryAt("Try again in 2 days 3 hours, 4 minutes 5 seconds.", now), now + (2 * day + 3 * hour + 4 * 60 + 5) * 1000);
+	assert.equal(usageRetryAt("Try again in ~0 min.", now), now);
+	assert.equal(usageRetryAt("Try again in 1.5 hours.", now), now + 90 * 60_000);
+	for (const text of ["Try again later", "Try again in -1 min", "Try again in Infinity min", "Try again in 1e100 min"]) {
+		assert.equal(usageRetryAt(text, now), undefined);
+	}
+	assert.ok(isUsageLimit("usage_limit_reached"));
+	assert.ok(isUsageLimit("Subscription quota exceeded"));
+	assert.equal(isUsageLimit("429: too many requests"), false);
+});
+
+test("auto-resume: always-on resumes once at the error's reset plus one minute, only after settlement", async t => {
+	const run = await createAutoResume(t);
+	await run.error();
+	assert.equal(run.timers.size, 0, "Pi's built-in retries must settle first");
+	await run.emit("agent_settled");
+	await run.emit("agent_settled");
+	assert.equal(run.timers.size, 1);
+	assert.ok([...run.timers][0].unreferenced);
+	run.jump(22 * 60_000);
+	assert.deepEqual(run.prompts, []);
+	run.jump(60_000);
+	assert.deepEqual(run.prompts, ["continue"]);
+	assert.equal(run.timers.size, 0);
+	assert.equal(run.statuses.get("apple-pi-auto-resume"), undefined);
+	run.jump(day * 1000);
+	assert.deepEqual(run.prompts, ["continue"], "No repeated jobs after a successful submission");
+});
+
+test("auto-resume: waiting messages and images join the transcript without changing the deadline", async t => {
+	const run = await createAutoResume(t);
+	await run.error();
+	// Input can arrive while the reset fetch is still pending, before scheduling.
+	assert.deepEqual(asPlain(await run.input("Also check the tests")), { action: "handled" });
+	await run.emit("agent_settled");
+	run.jump(10 * 60_000);
+	const image = { type: "image", data: "test-image", mimeType: "image/png" };
+	await run.input("And use this screenshot", [image]);
+	assert.equal(run.messages.length, 2);
+	assert.deepEqual(run.messages.map(entry => entry.delivery), [{ triggerTurn: false }, { triggerTurn: false }]);
+	assert.deepEqual(run.messages[1].message.content, [{ type: "text", text: "And use this screenshot" }, image]);
+	assert.ok(run.messages.every(entry => entry.message.display));
+	assert.ok(run.statuses.get("apple-pi-auto-resume").includes("2 queued"));
+	assert.deepEqual(run.prompts, []);
+	assert.equal(await run.input("/usage"), undefined, "Slash commands remain available");
+	assert.deepEqual(asPlain(await run.emit("cache_warming_decision")), { action: "stop" });
+
+	// Verify the queued transcript entries really become user content using
+	// Pi's installed converter, not a mock of the provider-context contract.
+	const { convertToLlm } = await import(new URL("./dist/core/messages.js", pathToFileURL(realpathSync(installedPackage))));
+	const context = convertToLlm(run.messages.map(({ message }) => ({ role: "custom", timestamp: now, ...message })));
+	assert.ok(context.every(message => message.role === "user"));
+	assert.deepEqual(context[0].content, [{ type: "text", text: "Also check the tests" }]);
+	assert.deepEqual(context[1].content, run.messages[1].message.content);
+	run.jump(13 * 60_000);
+	assert.deepEqual(run.prompts, ["continue"], "New input must not delay the original 23-minute deadline");
+});
+
+test("auto-resume: fresh exhausted main windows choose the later reset; unrelated buckets do not delay it", async t => {
+	const run = await createAutoResume(t, { usage: { rows: [
+		{ label: "5-hour", pct: 100, resetAt: now + hour * 1000 },
+		{ label: "weekly", pct: 100, resetAt: now + 7 * day * 1000 },
+		{ label: "reserve weekly", bucket: "reserve", pct: 100, resetAt: now + 30 * day * 1000 },
+		{ label: "other", pct: 25, resetAt: now + 60 * day * 1000 },
+	] } });
+	await run.error();
+	await run.emit("agent_settled");
+	run.jump(hour * 1000 + 60_000);
+	assert.deepEqual(run.prompts, []);
+	run.jump(6 * day * 1000 + 23 * hour * 1000);
+	assert.deepEqual(run.prompts, ["continue"]);
+});
+
+test("auto-resume: stale/invalid usage cannot override the error hint", async t => {
+	for (const usage of [
+		{ stale: "error 500", rows: [{ pct: 100, resetAt: now + 7 * day * 1000 }] },
+		{ rows: [{ pct: 100, resetAt: Infinity }, { pct: 100, resetAt: 1e20 }] },
+	]) {
+		const run = await createAutoResume(t, { usage });
+		await run.error();
+		await run.emit("agent_settled");
+		run.jump(23 * 60_000);
+		assert.deepEqual(run.prompts, ["continue"]);
+	}
+});
+
+test("auto-resume: unknown resets back off automatically, and known new limits can schedule again", async t => {
+	const run = await createAutoResume(t, { freshUsage: async () => { throw new Error("offline"); } });
+	for (const minutes of [15, 30, 60, 60]) {
+		await run.error("You have hit your ChatGPT usage limit. Try again later.");
+		await run.emit("agent_settled");
+		const before = run.prompts.length;
+		run.jump((minutes - 1) * 60_000);
+		assert.equal(run.prompts.length, before);
+		run.jump(60_000);
+		assert.equal(run.prompts.length, before + 1);
+	}
+	await run.error(quotaError);
+	await run.emit("agent_settled");
+	run.jump(23 * 60_000);
+	assert.equal(run.prompts.length, 5);
+});
+
+test("auto-resume: shutdown/reload/session replacement clear all timers and do not replay jobs", async t => {
+	for (const event of ["session_shutdown", "session_start", "session_tree", "model_select"]) {
+		const run = await createAutoResume(t);
+		await run.error();
+		await run.emit("agent_settled");
+		await run.emit(event);
+		assert.equal(run.timers.size, 0, event);
+		run.jump(30 * day * 1000);
+		assert.deepEqual(run.prompts, [], event);
+	}
+});
+
+test("auto-resume: a close during an awaited reset fetch cannot revive the timer", async t => {
+	let finish;
+	const run = await createAutoResume(t, { freshUsage: () => new Promise(resolve => { finish = resolve; }) });
+	await run.error();
+	const settling = run.emit("agent_settled");
+	await run.emit("session_shutdown");
+	await run.emit("session_start");
+	finish({ rows: [{ pct: 100, resetAt: now + 60_000 }] });
+	await settling;
+	assert.equal(run.timers.size, 0);
+	run.jump(24 * 60_000);
+	assert.deepEqual(run.prompts, []);
+});
+
+test("auto-resume: session identity is checked at delivery even if lifecycle notifications are missed", async t => {
+	const run = await createAutoResume(t);
+	await run.error();
+	await run.emit("agent_settled");
+	run.setSessionId("thread-2");
+	run.jump(23 * 60_000);
+	assert.equal(run.timers.size, 0);
+	assert.deepEqual(run.prompts, []);
+});
+
+test("auto-resume: waits for idle and approval dialogs without losing the deadline", async t => {
+	const run = await createAutoResume(t);
+	await run.error();
+	await run.emit("agent_settled");
+	run.setIdle(false);
+	run.jump(23 * 60_000);
+	assert.deepEqual(run.prompts, []);
+	run.setIdle(true);
+	await run.emit("ui_prompt_start");
+	run.jump(1000);
+	assert.deepEqual(run.prompts, []);
+	await run.emit("ui_prompt_end");
+	run.jump(1000);
+	assert.deepEqual(run.prompts, ["continue"]);
+});
+
+test("auto-resume: successful retries, other errors, and aborts cancel; ordinary input is unaffected otherwise", async t => {
+	const run = await createAutoResume(t);
+	assert.equal(await run.input("normal message"), undefined);
+	for (const [text, reason] of [[quotaError, "stop"], [quotaError, "aborted"], ["401 authentication failed", "error"], ["429 too many requests", "error"]]) {
+		await run.error();
+		await run.emit("agent_settled");
+		await run.error(text, reason);
+		assert.equal(run.timers.size, 0);
+		await run.emit("agent_settled");
+	}
+	assert.deepEqual(run.prompts, []);
+});
+
+test("auto-resume: the full extension wires fresh usage, queued input, footer status, and shutdown together", async t => {
+	const timers = new Set();
+	const clock = {
+		setTimeout(fn, delay) {
+			const timer = { fn, delay, unref() {} };
+			timers.add(timer);
+			return timer;
+		},
+		clearTimeout: timer => timers.delete(timer),
+	};
+	const run = await createFooter("openai-codex", plainTheme, 200, true, { mode: "rpc", clock });
+	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
+	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: quotaError } }, run.ctx);
+	await run.events.get("agent_settled")({}, run.ctx);
+	assert.equal(run.requests.length, 2, "Limit settlement forces fresh usage, without a duplicate footer request");
+	assert.equal(timers.size, 1);
+	assert.ok(plainText(run.footer).includes("Auto-resume at"));
+	assert.deepEqual(asPlain(await run.events.get("input")({ text: "check README too", source: "interactive" }, run.ctx)), { action: "handled" });
+	assert.equal(run.entries.at(-1).content, "check README too");
+	assert.ok(plainText(run.footer).includes("1 queued"));
+	assert.deepEqual(run.prompts, []);
+	await run.events.get("session_shutdown")({}, run.ctx);
+	assert.equal(timers.size, 0);
+	assert.ok(!plainText(run.footer).includes("Auto-resume"));
+});
+
+test("auto-resume: only long-lived TUI and RPC sessions schedule continuations", async t => {
+	for (const mode of ["print", "json", "rpc"]) {
+		const run = await createAutoResume(t, { mode });
+		await run.error();
+		await run.emit("agent_settled");
+		assert.equal(run.timers.size, mode === "rpc" ? 1 : 0, mode);
+	}
 });

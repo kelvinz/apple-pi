@@ -18,6 +18,9 @@
  * 5. A right-aligned previous-user-message button above the fullscreen editor.
  * 6. Fullscreen copy joins lines that the transcript wrapped at its width, so
  *    a copied paragraph pastes as one line. Intentional breaks stay.
+ * 7. Usage-limit errors automatically resume after reset + one minute.
+ *    Messages submitted while waiting join the thread without starting a turn.
+ *    Timers belong only to the running session and are cleared on shutdown.
  *
  * Plan data refreshes when the agent settles, when you change model,
  * and on /usage, but not more than once a minute per provider. Only the
@@ -56,7 +59,7 @@ const RESET_DATE = new Intl.DateTimeFormat("en-GB", { weekday: "short", day: "nu
 const RESET_TIME = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 const DAY_SECONDS = 24 * 3600;
 
-type Row = { label: string; pct?: number; resetAt?: number; windowSeconds?: number };
+type Row = { label: string; pct?: number; resetAt?: number; windowSeconds?: number; bucket?: string };
 
 // The window length decides whether to show the date, not the time left.
 // Both formatters use the computer's local time zone. Unknown windows get a date.
@@ -261,6 +264,175 @@ export function createPreviousMessageWidget(tui: TUI, theme: Theme, onUnavailabl
 			return { handled: true };
 		},
 	};
+}
+
+const RESUME_BUFFER_MS = 60_000;
+const UNKNOWN_RESET_RETRY_MS = 15 * 60_000;
+const AUTO_RESUME_STATUS = "apple-pi-auto-resume";
+
+// Only assistant errors qualify. Ordinary 429s, auth errors, and successful
+// replies discussing quotas must never start unattended work.
+export function isUsageLimit(error: string): boolean {
+	return /usage[_ ]limit(?:[_ ]reached)?|(?:quota|subscription limit).{0,50}(?:exhausted|exceeded|reached)|(?:exhausted|exceeded|reached).{0,50}(?:quota|subscription limit)/i.test(error);
+}
+
+// Pi's Codex adapter turns resets_at into "Try again in ~N min.". Keep the
+// failure's timestamp, rather than measuring N minutes from a later HTTP fetch.
+export function usageRetryAt(error: string, failedAt: number): number | undefined {
+	const retry = /try again in\s*[~≈]?\s*((?:\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*)+)/i.exec(error)?.[1];
+	if (!retry) return undefined;
+	let duration = 0;
+	for (const match of retry.matchAll(/(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/gi)) {
+		const unit = match[2].toLowerCase()[0];
+		duration += Number(match[1]) * ({ d: 86_400_000, h: 3_600_000, m: 60_000, s: 1000 }[unit] ?? 0);
+	}
+	const stamp = failedAt + duration;
+	return Number.isFinite(stamp) && Number.isFinite(new Date(stamp).getTime()) ? stamp : undefined;
+}
+
+/** Session-owned only: no cron, subprocess, persisted job, or startup replay. */
+export function installAutoResume(
+	pi: ExtensionAPI,
+	freshUsage: (ctx: ExtensionContext) => Promise<ProviderStatus | undefined>,
+): void {
+	type Wait = {
+		ctx: ExtensionContext;
+		sessionId: string;
+		provider: string | undefined;
+		model: string | undefined;
+		error: string;
+		failedAt: number;
+		deadline?: number;
+		queued: number;
+	};
+	let active = false;
+	let waiting: Wait | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let dialogs = 0;
+	let unknownRetries = 0;
+
+	function status(ctx: ExtensionContext, text?: string): void {
+		try { ctx.ui.setStatus(AUTO_RESUME_STATUS, text); } catch { /* Stale UI. */ }
+	}
+
+	function clear(): void {
+		if (timer !== undefined) clearTimeout(timer);
+		timer = undefined;
+		const old = waiting;
+		waiting = undefined;
+		if (old) status(old.ctx);
+	}
+
+	function current(wait: Wait): boolean {
+		return active && waiting === wait &&
+			wait.ctx.sessionManager.getSessionId() === wait.sessionId &&
+			wait.ctx.model?.provider === wait.provider && wait.ctx.model?.id === wait.model;
+	}
+
+	function show(wait: Wait): void {
+		const when = wait.deadline === undefined ? "checking reset time" : `at ${RESET_DATE.format(wait.deadline)}, ${RESET_TIME.format(wait.deadline)}`;
+		status(wait.ctx, `Auto-resume ${when}${wait.queued ? ` · ${wait.queued} queued` : ""}`);
+	}
+
+	function tick(wait: Wait): void {
+		if (waiting !== wait) return;
+		timer = undefined;
+		if (!current(wait)) { clear(); return; }
+		const remaining = wait.deadline! - Date.now();
+		if (remaining > 0 || !wait.ctx.isIdle() || dialogs > 0) {
+			// Absolute deadlines survive sleep/wake; short timer chunks also avoid
+			// Node's ~24-day timeout overflow on long subscription windows.
+			timer = setTimeout(() => tick(wait), remaining > 0 ? Math.min(remaining, 60_000) : 1000);
+			timer.unref?.();
+			return;
+		}
+		clear(); // Clear before sending: never let our continuation queue itself.
+		try { pi.sendUserMessage("continue"); } catch {
+			try { wait.ctx.ui.notify("Auto-resume could not submit a continuation.", "warning"); } catch { /* Stale UI. */ }
+		}
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		clear();
+		active = ctx.mode === "tui" || ctx.mode === "rpc";
+		dialogs = 0;
+		unknownRetries = 0;
+	});
+	pi.on("session_shutdown", () => {
+		active = false;
+		clear();
+		dialogs = 0;
+	});
+	// A different branch or model must not inherit an old failure's timer.
+	pi.on("session_tree", () => { clear(); unknownRetries = 0; });
+	pi.on("model_select", () => { clear(); unknownRetries = 0; });
+	pi.on("ui_prompt_start", () => { dialogs++; });
+	pi.on("ui_prompt_end", () => { dialogs = Math.max(0, dialogs - 1); });
+	pi.on("cache_warming_decision", () => waiting ? { action: "stop" } : undefined);
+
+	pi.on("message_end", (event, ctx) => {
+		if (!active || event.message.role !== "assistant") return;
+		const message = event.message;
+		if (message.stopReason !== "error" || !isUsageLimit(message.errorMessage ?? "")) {
+			clear();
+			unknownRetries = 0;
+			return;
+		}
+		const queued = waiting?.queued ?? 0;
+		clear();
+		waiting = {
+			ctx, sessionId: ctx.sessionManager.getSessionId(),
+			provider: ctx.model?.provider, model: ctx.model?.id,
+			error: message.errorMessage!, failedAt: Date.now(), queued,
+		};
+		show(waiting);
+	});
+
+	pi.on("input", (event, ctx) => {
+		const wait = waiting;
+		// Built-in /commands remain usable. Extension-generated messages are
+		// also real prompts and should queue rather than hammer an exhausted plan.
+		if (!wait || !current(wait) || event.text.startsWith("/")) return;
+		wait.ctx = ctx;
+		const content = event.images?.length
+			? [{ type: "text" as const, text: event.text }, ...event.images]
+			: event.text;
+		// Custom messages with triggerTurn:false appear immediately in the
+		// transcript and are converted to user messages in Pi's provider context.
+		// Unlike sendUserMessage, this does not start a premature model request.
+		pi.sendMessage({ customType: "apple-pi-queued", content, display: true }, { triggerTurn: false });
+		wait.queued++;
+		show(wait);
+		return { action: "handled" };
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		const wait = waiting;
+		if (!wait || !current(wait) || wait.deadline !== undefined) return;
+		wait.ctx = ctx;
+		let usage: ProviderStatus | undefined;
+		try { usage = await freshUsage(ctx); } catch { /* Error hint still works. */ }
+		// Shutdown/reload/session replacement can happen during the fetch.
+		if (!current(wait) || wait.deadline !== undefined) return;
+		const hint = usageRetryAt(wait.error, wait.failedAt);
+		// Additional buckets may belong to another model, so do not let them
+		// postpone a main-plan retry. Never schedule from retained stale rows.
+		const resets = usage && !usage.stale ? usage.rows
+			.filter(row => !row.bucket && row.pct !== undefined && row.pct >= 100 && row.resetAt !== undefined && Number.isFinite(new Date(row.resetAt).getTime()))
+			.map(row => row.resetAt!) : [];
+		const known = [hint, ...resets].filter((stamp): stamp is number => stamp !== undefined);
+		if (known.length) {
+			wait.deadline = Math.max(Date.now(), ...known) + RESUME_BUFFER_MS;
+			unknownRetries = 0;
+		} else {
+			// No trustworthy reset information: retry conservatively, backing off
+			// to one hour rather than inventing an exact reset or looping rapidly.
+			wait.deadline = Date.now() + Math.min(UNKNOWN_RESET_RETRY_MS * 2 ** Math.min(unknownRetries++, 2), 60 * 60_000);
+		}
+		show(wait);
+		timer = setTimeout(() => tick(wait), Math.min(wait.deadline - Date.now(), 60_000));
+		timer.unref?.();
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -493,7 +665,7 @@ export default function (pi: ExtensionAPI) {
 			for (const w of [extra?.rate_limit?.primary_window, extra?.rate_limit?.secondary_window]) {
 				if (!w) continue;
 				const r = row(w);
-				rows.push({ ...r, label: `${name} ${r.label}` });
+				rows.push({ ...r, label: `${name} ${r.label}`, bucket: name });
 			}
 		}
 		return { plan: typeof json.plan_type === "string" ? json.plan_type : undefined, rows };
@@ -953,6 +1125,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---------- wiring ----------
+
+	installAutoResume(pi, async ctx => {
+		const key = ctx.model ? PROVIDER_KEYS[ctx.model.provider] : undefined;
+		if (!key) return undefined;
+		// An in-flight fetch may return the previous cache immediately. Treat
+		// that as unavailable rather than mistaking old data for a fresh reset.
+		return await fetchProvider(key, true) ? cache.get(key) : undefined;
+	});
 
 	pi.on("session_shutdown", () => {
 		sessionActive = false;
