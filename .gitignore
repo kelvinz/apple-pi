@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+.pi/
+auth.json
+settings.json
+sessions/

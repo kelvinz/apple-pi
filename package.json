@@ -1,0 +1,25 @@
+{
+  "name": "apple-pi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Pi UI and workflow changes, with provider usage and local reset times.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kelvinz/apple-pi.git"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "pi": {
+    "extensions": ["./extensions/apple-pi.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  }
+}
