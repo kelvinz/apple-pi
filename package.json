@@ -4,6 +4,9 @@
   "private": true,
   "description": "Personal Pi UI and workflow changes, with provider usage and local reset times.",
   "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/kelvinz/apple-pi.git"

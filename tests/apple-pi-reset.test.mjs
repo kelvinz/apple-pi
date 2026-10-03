@@ -1,5 +1,6 @@
 // Run from the repository root: pnpm test
-// Uses Pi's installed compiler and TUI helpers. Auth and HTTP are mocked.
+// Uses Pi's installed jiti compiler and TUI helpers. Auth and HTTP are mocked.
+// Pi is found through `pnpm root -g` and `npm root -g`, or set PI_PACKAGE_DIR.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -9,10 +10,15 @@ import { test } from "node:test";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 
-const globalModules = execFileSync("pnpm", ["root", "-g"], { encoding: "utf8" }).trim();
 const packagePath = "@earendil-works/pi-coding-agent/package.json";
-const installedPackage = [join(globalModules, packagePath), ...readdirSync(globalModules).map(dir => join(globalModules, dir, "node_modules", packagePath))].find(existsSync);
-assert.ok(installedPackage, "Pi must be installed through pnpm");
+const globalRoots = ["pnpm", "npm"].flatMap(cmd => {
+	try { return [execFileSync(cmd, ["root", "-g"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()]; } catch { return []; }
+});
+const installedPackage = [
+	process.env.PI_PACKAGE_DIR && join(process.env.PI_PACKAGE_DIR, "package.json"),
+	...globalRoots.flatMap(root => [join(root, packagePath), ...(existsSync(root) ? readdirSync(root) : []).map(dir => join(root, dir, "node_modules", packagePath))]),
+].find(path => path && existsSync(path));
+assert.ok(installedPackage, "Pi must be installed globally with pnpm or npm, or PI_PACKAGE_DIR must point at it");
 const requirePi = createRequire(realpathSync(installedPackage));
 const { createJiti } = requirePi("jiti");
 const tui = await import(pathToFileURL(requirePi.resolve("@earendil-works/pi-tui")));
@@ -78,7 +84,7 @@ function loadExtension(responses = {}, state = { status: 200 }) {
 	return { ...exports, requests, toolCalls, settingsCalls };
 }
 
-const { formatReset } = loadExtension();
+const { formatReset, reflowText } = loadExtension();
 const row = (windowSeconds, stamp = resetAt) => ({ label: "test", resetAt: stamp, windowSeconds });
 
 test("hourly windows show local 24-hour time without a date", () => {
@@ -293,4 +299,38 @@ test("tokens and cost follow each turn without waiting for the run to settle", a
 	const text = plainText(footer);
 	assert.ok(text.includes("1.5k tokens used"));
 	assert.ok(text.includes("$0.50"));
+});
+
+// reflowText joins rows the transcript wrapped, and nothing else. Room is 20 columns.
+test("reflow joins a forced wrap and keeps rows that could have fit", () => {
+	assert.equal(reflowText("aaaa bbbb cccc dddd\neeee ffff", 20), "aaaa bbbb cccc dddd eeee ffff");
+	assert.equal(reflowText("the quick brown fox\njumps over the\nlazy dog", 20), "the quick brown fox jumps over the\nlazy dog");
+	assert.equal(reflowText("one\ntwo\nthree", 20), "one\ntwo\nthree");
+});
+
+test("reflow rejoins a word cut in pieces without adding a space", () => {
+	assert.equal(reflowText(`${"x".repeat(20)}\nyyyy`, 20), `${"x".repeat(20)}yyyy`);
+});
+
+test("reflow keeps paragraph breaks, tables, and indented code", () => {
+	assert.equal(reflowText("aaaa bbbb cccc dddd\n\neeee", 20), "aaaa bbbb cccc dddd\n\neeee");
+	assert.equal(reflowText("│ a │ b │\n│ c │ d │", 20), "│ a │ b │\n│ c │ d │");
+	assert.equal(reflowText("aaaa bbbb cccc dddd\n    code here", 20), "aaaa bbbb cccc dddd\n    code here");
+});
+
+test("reflow joins list continuations and quote rows but not new items", () => {
+	assert.equal(reflowText("- aaaa bbbb cccc ddd\n  eeee ffff\n- next", 20), "- aaaa bbbb cccc ddd eeee ffff\n- next");
+	assert.equal(reflowText("1. aaaa bbbb cccc dd\n   eeee\n2. next", 20), "1. aaaa bbbb cccc dd eeee\n2. next");
+	assert.equal(reflowText("│ aaaa bbbb cccc ddd\n│ eeee ffff", 20), "│ aaaa bbbb cccc ddd eeee ffff");
+});
+
+test("reflow strips transcript padding, accepts CRLF, and handles a selection that starts mid-row", () => {
+	assert.equal(reflowText(" aaaa bbbb cccc dddd\n eeee ffff", 20, 1), "aaaa bbbb cccc dddd eeee ffff");
+	assert.equal(reflowText("aaaa bbbb cccc dddd\r\neeee", 20), "aaaa bbbb cccc dddd eeee");
+	assert.equal(reflowText("bbbb cccc dddd\neeee", 20, 1, 6), "bbbb cccc dddd eeee");
+});
+
+test("reflow keeps a new list item after a mid-row selection, and indented rows apart", () => {
+	assert.equal(reflowText("bbbb cccc dddd eeee\n- ffff", 20, 1, 6), "bbbb cccc dddd eeee\n- ffff");
+	assert.equal(reflowText("  aaaa bbbb cccc dd\n  eeee", 20), "  aaaa bbbb cccc dd\n  eeee");
 });
