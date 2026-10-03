@@ -17,7 +17,8 @@
  *    ("… thinking") blocks. Display-only; user messages stay untouched.
  * 5. A right-aligned previous-user-message button above the fullscreen editor.
  * 6. Fullscreen copy joins lines that the transcript wrapped at its width, so
- *    a copied paragraph pastes as one line. Intentional breaks stay.
+ *    a copied paragraph pastes as one line. Intentional breaks stay. Inside
+ *    Herdr, selections go through the terminal to the viewing computer's clipboard.
  * 7. Usage-limit errors automatically resume after reset + one minute.
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
@@ -169,6 +170,8 @@ export function reflowText(text: string, room: number, pad = 0, startCol = 0): s
 }
 
 const ORIGINAL_COPY = Symbol.for("apple-pi.copySelection");
+// Same encoded-payload ceiling as Pi's built-in terminal clipboard writer.
+const MAX_CLIPBOARD_BASE64_LENGTH = 100_000;
 type CopySelection = (text: string) => Promise<boolean | string>;
 // Pi exposes no public copy hook. These fields exist on the fullscreen TUI only.
 type CopyTui = {
@@ -182,14 +185,17 @@ type CopyTui = {
  * Reflow text before the fullscreen TUI copies a selection. The pristine copy
  * function is kept under a global symbol, so a /reload replaces the wrapper
  * instead of stacking a new one on it. Copy never fails because of reflow:
- * any problem copies the text as selected.
+ * any problem copies the text as selected. Herdr panes can lack SSH variables,
+ * so Pi may otherwise report success from writing only the remote clipboard.
+ * Route selections through Herdr's terminal forwarding instead, for both local
+ * and remote panes. Leave Pi's native route unchanged outside Herdr.
  */
 export function patchCopyReflow(tui: TUI, outputPad: () => number): void {
 	const t = tui as unknown as CopyTui;
 	const original = t[ORIGINAL_COPY] ?? t.copySelection;
 	if (typeof original !== "function") return;
 	t[ORIGINAL_COPY] = original;
-	t.copySelection = text => {
+	t.copySelection = async text => {
 		let copied = text;
 		try {
 			// Only selections in a scroll view (the transcript) have a known wrap width.
@@ -200,6 +206,23 @@ export function patchCopyReflow(tui: TUI, outputPad: () => number): void {
 			if (start && width) copied = reflowText(text, width - 2 * pad, pad, start.col);
 		} catch {
 			// Copy the selection unchanged.
+		}
+		if (process.env.HERDR_ENV === "1") {
+			// OSC 52 is a clipboard-write request, not a shell command. Encoding
+			// the whole UTF-8 selection also keeps terminal controls inert.
+			const encoded = Buffer.from(copied, "utf8").toString("base64");
+			if (encoded.length > MAX_CLIPBOARD_BASE64_LENGTH) {
+				return "Selection is too large to copy through the terminal. Copy a smaller selection.";
+			}
+			try {
+				tui.terminal.write(`\x1b]52;c;${encoded}\x07`);
+				// The terminal sends no acknowledgement. Pi's normal "Copied"
+				// feedback means the request was sent, not independently verified.
+				return true;
+			} catch {
+				// Do not fall back to a remote-only native write and claim success.
+				return "Could not send the selection to your terminal clipboard.";
+			}
 		}
 		return original(copied);
 	};

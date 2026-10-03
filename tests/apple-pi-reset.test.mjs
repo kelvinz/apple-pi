@@ -33,7 +33,7 @@ const day = 24 * hour;
 const settingsFailure = { on: false };
 
 // `state.status` is the HTTP status every mocked request returns; tests change it mid-run.
-function loadExtension(responses = {}, state = { status: 200 }, clock = {}) {
+function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env = {}) {
 	const exports = {};
 	const requests = [];
 	const toolCalls = {};
@@ -75,7 +75,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}) {
 		Intl, Buffer, AbortSignal, setImmediate,
 		setTimeout: clock.setTimeout ?? setTimeout,
 		clearTimeout: clock.clearTimeout ?? clearTimeout,
-		process: { env: {} },
+		process: { env },
 		fetch: async url => {
 			requests.push(url);
 			assert.ok(Object.hasOwn(responses, url), `Unexpected HTTP request: ${url}`);
@@ -156,7 +156,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
 	const state = { status };
-	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state, options.clock);
+	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state, options.clock, options.env);
 	const events = new Map();
 	const commands = new Map();
 	const tools = [];
@@ -184,7 +184,9 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 		model: { id: "test", provider },
 		sessionManager: { getEntries: () => entries, getCwd: () => "/mock", getSessionId: () => "footer-thread" },
 		ui: {
-			setWidget() {},
+			setWidget(_key, factory) {
+				if (options.copyTui && typeof factory === "function") factory(options.copyTui, theme);
+			},
 			setStatus: (key, value) => value === undefined ? statuses.delete(key) : statuses.set(key, value),
 			notify: (message, level) => notices.push([message, level]),
 			setFooter(factory) {
@@ -346,6 +348,158 @@ test("reflow strips transcript padding, accepts CRLF, and handles a selection th
 test("reflow keeps a new list item after a mid-row selection, and indented rows apart", () => {
 	assert.equal(reflowText("bbbb cccc dddd eeee\n- ffff", 20, 1, 6), "bbbb cccc dddd eeee\n- ffff");
 	assert.equal(reflowText("  aaaa bbbb cccc dd\n  eeee", 20), "  aaaa bbbb cccc dd\n  eeee");
+});
+
+function copyFixture() {
+	const nativeCopies = [];
+	const terminalWrites = [];
+	const scrollView = {};
+	const copyTui = {
+		mode: "fullscreen",
+		terminal: { write: sequence => terminalWrites.push(sequence) },
+		copySelection: async text => { nativeCopies.push(text); return true; },
+		getSelectionBounds: () => ({ start: { col: 0, scrollView } }),
+		currentLayout: { root: { scrollView, children: [{ rect: { width: 22 } }] } },
+	};
+	return { copyTui, nativeCopies, terminalWrites };
+}
+
+function clipboardSequence(text) {
+	// Independent wire-format expectation, including UTF-8 before base64.
+	return `\x1b]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
+}
+
+test("chat copy: Herdr sends the reflowed selection to the viewing computer, without touching the host clipboard", async () => {
+	for (const env of [{ HERDR_ENV: "1" }, { HERDR_ENV: "1", SSH_CONNECTION: "test" }]) {
+		const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, env);
+		const { copyTui, nativeCopies, terminalWrites } = copyFixture();
+		patchCopyReflow(copyTui, () => 1);
+		assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee ffff"), true);
+		assert.deepEqual(terminalWrites, [clipboardSequence("aaaa bbbb cccc dddd eeee ffff")]);
+		assert.deepEqual(nativeCopies, [], "No success from writing only the remote machine's clipboard");
+	}
+});
+
+test("chat copy: outside Herdr, native copying and reflow stay unchanged", async () => {
+	for (const env of [{}, { HERDR_ENV: "0" }, { SSH_CONNECTION: "test" }]) {
+		const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, env);
+		const { copyTui, nativeCopies, terminalWrites } = copyFixture();
+		patchCopyReflow(copyTui, () => 1);
+		assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee"), true);
+		assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"]);
+		assert.deepEqual(terminalWrites, []);
+	}
+});
+
+test("chat copy: Unicode, paragraphs, and terminal-control characters are encoded without changes or injection", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, { HERDR_ENV: "1" });
+	const { copyTui, terminalWrites } = copyFixture();
+	copyTui.getSelectionBounds = () => undefined;
+	patchCopyReflow(copyTui, () => 1);
+	const text = "你好 😀 café\n\nsecond paragraph\n\x1b]52;c;bad\x07";
+	assert.equal(await copyTui.copySelection(text), true);
+	assert.deepEqual(terminalWrites, [clipboardSequence(text)]);
+});
+
+test("chat copy: unsafe selection-layout reads still copy the original text to the viewing computer", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, { HERDR_ENV: "1" });
+	const { copyTui, nativeCopies, terminalWrites } = copyFixture();
+	copyTui.getSelectionBounds = () => { throw new Error("layout changed"); };
+	patchCopyReflow(copyTui, () => 1);
+	const text = " selected\n lines";
+	assert.equal(await copyTui.copySelection(text), true);
+	assert.deepEqual(terminalWrites, [clipboardSequence(text)]);
+	assert.deepEqual(nativeCopies, []);
+});
+
+test("chat copy: the terminal size limit is based on encoded UTF-8, and oversize copies do not report success", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, { HERDR_ENV: "1" });
+	for (const [text, allowed] of [["x".repeat(75_000), true], ["x".repeat(75_001), false], ["😀".repeat(18_750), true], ["😀".repeat(18_751), false]]) {
+		const { copyTui, nativeCopies, terminalWrites } = copyFixture();
+		copyTui.getSelectionBounds = () => undefined;
+		patchCopyReflow(copyTui, () => 1);
+		const result = await copyTui.copySelection(text);
+		if (allowed) {
+			assert.equal(result, true);
+			assert.deepEqual(terminalWrites, [clipboardSequence(text)]);
+		} else {
+			assert.equal(result, "Selection is too large to copy through the terminal. Copy a smaller selection.");
+			assert.deepEqual(terminalWrites, []);
+		}
+		assert.deepEqual(nativeCopies, []);
+	}
+});
+
+test("chat copy: terminal write failures do not fall back to a misleading remote-only copy", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, { HERDR_ENV: "1" });
+	const { copyTui, nativeCopies } = copyFixture();
+	copyTui.terminal.write = () => { throw new Error("closed terminal"); };
+	patchCopyReflow(copyTui, () => 1);
+	assert.equal(await copyTui.copySelection("text"), "Could not send the selection to your terminal clipboard.");
+	assert.deepEqual(nativeCopies, []);
+});
+
+test("chat copy: reload replaces the wrapper rather than stacking copies", async () => {
+	for (const env of [{ HERDR_ENV: "1" }, {}]) {
+		const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, env);
+		const { copyTui, nativeCopies, terminalWrites } = copyFixture();
+		patchCopyReflow(copyTui, () => 1);
+		patchCopyReflow(copyTui, () => 0);
+		copyTui.getSelectionBounds = () => undefined;
+		await copyTui.copySelection("one copy");
+		assert.equal(nativeCopies.length + terminalWrites.length, 1);
+		assert.deepEqual(env.HERDR_ENV ? terminalWrites : nativeCopies, env.HERDR_ENV ? [clipboardSequence("one copy")] : ["one copy"]);
+	}
+});
+
+test("chat copy: unsupported TUI layouts are left alone", () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, { HERDR_ENV: "1" });
+	const terminalWrites = [];
+	const copyTui = { terminal: { write: sequence => terminalWrites.push(sequence) } };
+	patchCopyReflow(copyTui, () => 1);
+	assert.equal(copyTui.copySelection, undefined);
+	assert.deepEqual(terminalWrites, []);
+});
+
+test("chat copy: Pi's real selection-copy action displays success only when the terminal write succeeds", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, { HERDR_ENV: "1" });
+	const terminalWrites = [];
+	const nativeCopies = [];
+	const flashes = [];
+	const terminal = { columns: 22, rows: 10, write: sequence => terminalWrites.push(sequence) };
+	const liveTui = new tui.TuiAltScreen(terminal, false, undefined, {
+		copySelection: async text => { nativeCopies.push(text); return true; },
+	});
+	// Set the last rendered transcript and selection, without starting a terminal.
+	const scrollView = {};
+	liveTui.currentLayout = { root: {
+		scrollView,
+		children: [{ rect: { width: 22 }, children: [] }],
+		scrollContentLines: [" aaaa bbbb cccc dddd", " eeee ffff"],
+	} };
+	liveTui.selectionAnchor = { col: 0, row: 0, scrollView };
+	liveTui.selectionFocus = { col: 10, row: 1, scrollView };
+	liveTui.flash = message => flashes.push(message);
+	patchCopyReflow(liveTui, () => 1);
+	assert.equal(await liveTui.copyActiveSelectionToClipboard(), true);
+	assert.deepEqual(terminalWrites, [clipboardSequence("aaaa bbbb cccc dddd eeee ffff")]);
+	assert.deepEqual(flashes, ["Copied!"]);
+	terminal.write = () => { throw new Error("closed terminal"); };
+	assert.equal(await liveTui.copyActiveSelectionToClipboard(), false);
+	assert.deepEqual(flashes, ["Copied!", "Could not send the selection to your terminal clipboard."]);
+	assert.deepEqual(nativeCopies, []);
+});
+
+test("chat copy: session startup installs the local-clipboard route on the live chat selection hook", async () => {
+	const { copyTui, nativeCopies, terminalWrites } = copyFixture();
+	const run = await createFooter("anthropic", plainTheme, 200, true, { mode: "tui", copyTui, env: { HERDR_ENV: "1" } });
+	try {
+		assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee"), true);
+		assert.deepEqual(terminalWrites, [clipboardSequence("aaaa bbbb cccc dddd eeee")]);
+		assert.deepEqual(nativeCopies, []);
+	} finally {
+		await run.events.get("session_shutdown")({}, run.ctx);
+	}
 });
 
 const quotaError = "You have hit your ChatGPT usage limit (plus plan). Try again in ~22 min.";

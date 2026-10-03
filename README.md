@@ -8,7 +8,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 - A footer with the directory, Git branch, session name, token use, cost, context use, model, thinking level, and extension status.
 - Small titles above tool calls, assistant replies, and thinking blocks. Built-in tool results and expand/collapse controls stay in place.
 - A **previous message** button above the fullscreen editor.
-- Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks.
+- Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks. In Herdr, selected text goes to the clipboard of the computer viewing the chat, including remote chats. No setting is needed.
 - Automatic continuation after a subscription usage limit resets, with messages added while waiting included on resume. No settings or enable command.
 
 Reset times use the computer's local time zone and a 24-hour clock:
@@ -93,6 +93,14 @@ Then run `/reload` in Pi. Commit and push before switching computers. If `git pu
 
 `pi update --extensions` does not pull this working repository; `git pull` is the update path.
 
+## Copy from a remote chat
+
+In Pi's fullscreen chat, select text and copy it as usual. Inside Herdr, apple-pi sends the selection through the terminal to the clipboard of the computer viewing the chat. It does not rely on SSH environment variables, which can be missing in persistent remote panes. This route is used in both local and remote Herdr panes; it does not write to the remote Mac's native clipboard.
+
+Paragraph formatting stays the same: transcript-wrapped lines are joined, while intentional line breaks, lists, tables, and code are preserved. Outside Herdr, Pi's usual clipboard route is unchanged. Pi's separate `/copy` or “copy last reply” action without a selection, and Claude's copy actions, are not changed.
+
+The viewing terminal must allow terminal clipboard writes (OSC 52). “Copied” means the request was sent; the terminal gives no confirmation that it accepted it. A write error or a selection over 100,000 base64 characters (75,000 UTF-8 bytes) shows an error instead. Copy a smaller selection if needed. The extension does not read the clipboard, create clipboard-sync jobs, or save copied text.
+
 ## Automatic resume
 
 In long-lived Pi terminal and RPC sessions, a finalized assistant usage-limit error automatically schedules `continue` for the reset time plus one minute. Pi's own retries finish first. There is nothing to configure or turn on.
@@ -118,12 +126,12 @@ TZ=America/New_York pnpm test
 TZ=UTC pnpm test
 ```
 
-The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, tool registration with Pi's settings, and the copy reflow rules. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
+The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
 
 They do not cover live provider endpoints, live auto-resume behavior, or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
 
 1. For Codex and Z.ai, select the model and run `/usage`. Compare the percentage left and reset time with the provider's usage page.
-2. In fullscreen mode, select a paragraph that wraps across several lines and paste it into another app. Done when the paragraph has no extra line breaks and intentional paragraph breaks remain.
+2. In fullscreen mode, select a paragraph that wraps across several lines and paste it into another app. Repeat from a remote Herdr chat and paste into a local app. Done when the local clipboard has the selected text, the paragraph has no extra line breaks, and intentional paragraph breaks remain.
 3. Scroll past an earlier user message and click **previous message**. Done when it returns you to that message.
 4. When a real subscription limit occurs, check the auto-resume time, submit another message, and verify it is shown as queued without another provider request. Done when Pi continues once after the deadline with that message in context. Separately close/reload a waiting session and confirm no old continuation fires.
 
