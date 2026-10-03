@@ -1008,10 +1008,16 @@ export default function (pi: ExtensionAPI) {
 		updateSnapshotAndRender(ctx);
 	});
 
-	// Turn complete: refetch provider data (at most once a minute) and render.
+	// Run settled: refetch provider data (at most once a minute) and render.
 	pi.on("agent_settled", async (_event, ctx) => {
 		updateSnapshotAndRender(ctx);
 		await refresh(false);
+	});
+
+	// Each turn's tokens, cost, and context land in the session here, so the
+	// footer keeps up during a long run instead of waiting for it to settle.
+	pi.on("turn_end", async (_event, ctx) => {
+		updateSnapshotAndRender(ctx);
 	});
 
 	// Model switch swaps which plan row is shown and the footer's right side.

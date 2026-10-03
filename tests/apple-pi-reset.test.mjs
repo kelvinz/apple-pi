@@ -167,11 +167,12 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 		registerCommand: (name, command) => commands.set(name, command),
 		registerMarkdownTransformer() {},
 	});
+	const entries = [];
 	const notices = [];
 	const ctx = {
 		mode: "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted,
 		model: { id: "test", provider },
-		sessionManager: { getEntries: () => [], getCwd: () => "/mock" },
+		sessionManager: { getEntries: () => entries, getCwd: () => "/mock" },
 		ui: {
 			setWidget() {},
 			notify: (message, level) => notices.push([message, level]),
@@ -187,7 +188,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(extension.requests.length, 1);
-	return { footer, fixture, events, commands, ctx, state, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
+	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
@@ -282,4 +283,14 @@ test("a settings read failure warns and still registers the tools without settin
 	} finally {
 		settingsFailure.on = false;
 	}
+});
+
+test("tokens and cost follow each turn without waiting for the run to settle", async () => {
+	const { footer, events, ctx, entries } = await createFooter("zai", plainTheme);
+	assert.ok(plainText(footer).includes("new chat"));
+	entries.push({ type: "message", message: { role: "assistant", usage: { totalTokens: 1500, cost: { total: 0.5 } } } });
+	await events.get("turn_end")({}, ctx);
+	const text = plainText(footer);
+	assert.ok(text.includes("1.5k tokens used"));
+	assert.ok(text.includes("$0.50"));
 });
