@@ -53,7 +53,7 @@ import { readFileSync } from "node:fs";
 import { join, sep } from "node:path";
 
 const MIN_FETCH_GAP_MS = 60 * 1000;
-const FETCH_TIMEOUT_MS = 8 * 1000;
+const FETCH_TIMEOUT_MS = 10 * 1000;
 const TOKEN_EXPIRED_NOTE = "token expired — run /login";
 const BAR_WIDTH = 10;
 // Built once: the footer re-renders on every frame, and building a formatter
@@ -740,7 +740,9 @@ export default function (pi: ExtensionAPI) {
 			next = job ? await job : { rows: [], note: "not set up" };
 			failed = job !== undefined && next.rows.length === 0 && next.note !== undefined;
 		} catch (e) {
-			next = { rows: [], note: errText(e) };
+			next = { rows: [], note: e instanceof Error && e.name === "TimeoutError"
+				? "Usage request timed out; try /usage"
+				: errText(e) };
 			failed = true;
 		}
 		// A blip must not erase the last good numbers: keep them, say they are old.

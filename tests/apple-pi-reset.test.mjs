@@ -72,13 +72,14 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 			throw new Error(`Unexpected import: ${name}`);
 		},
 		Date: class extends Date { static now() { return clock.now?.() ?? now; } },
-		Intl, Buffer, AbortSignal, setImmediate,
+		Intl, Buffer, Error, AbortSignal: clock.AbortSignal ?? AbortSignal, setImmediate,
 		setTimeout: clock.setTimeout ?? setTimeout,
 		clearTimeout: clock.clearTimeout ?? clearTimeout,
 		process: { env },
-		fetch: async url => {
+		fetch: async (url, options) => {
 			requests.push(url);
 			assert.ok(Object.hasOwn(responses, url), `Unexpected HTTP request: ${url}`);
+			await state.beforeResponse?.(options);
 			return { ok: state.status >= 200 && state.status < 300, status: state.status, json: async () => responses[url] };
 		},
 	});
@@ -249,6 +250,32 @@ for (const provider of Object.keys(fixtures)) {
 		}
 	});
 }
+
+test("Codex: a ten-second timeout keeps cached usage and a successful retry clears the warning", async () => {
+	let signal;
+	const timeouts = [];
+	const clock = { AbortSignal: { timeout(ms) {
+		timeouts.push(ms);
+		signal = new AbortController();
+		return signal.signal;
+	} } };
+	const { footer, commands, ctx, state } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	assert.ok(plainText(footer).includes("75% left"));
+	state.beforeResponse = ({ signal }) => new Promise((resolve, reject) => {
+		signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+	});
+	const pending = commands.get("usage").handler("", ctx);
+	assert.deepEqual(timeouts, [10_000, 10_000]);
+	const error = new Error("The operation was aborted due to timeout");
+	error.name = "TimeoutError";
+	signal.abort(error);
+	await pending;
+	assert.ok(plainText(footer).includes("75% left"));
+	assert.ok(plainText(footer).includes("showing last result · Usage request timed out; try /usage"));
+	state.beforeResponse = undefined;
+	await commands.get("usage").handler("", ctx);
+	assert.ok(!plainText(footer).includes("showing last result"));
+});
 
 test("zai: a failed refresh keeps the last good rows and says they are old", async () => {
 	const { footer, commands, ctx, state } = await createFooter("zai", plainTheme);
@@ -865,8 +892,15 @@ test("auto-resume: a footer refresh still running at settlement is followed by a
 	// More than a minute after the session-start fetch, so the turn starts a footer refresh.
 	clock.t += 61_000;
 	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: quotaError } }, run.ctx);
+	let release;
+	run.state.beforeResponse = () => new Promise(resolve => { release = resolve; });
 	await run.events.get("turn_end")({}, run.ctx);
-	await run.events.get("agent_settled")({}, run.ctx);
+	const settled = run.events.get("agent_settled")({}, run.ctx);
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(run.requests.length, 2, "Auto-resume waits for the pending footer fetch");
+	run.state.beforeResponse = undefined;
+	release();
+	await settled;
 	assert.equal(run.requests.length, 3, "Session start, the turn's refresh, then a fresh fetch for auto-resume");
 });
 
