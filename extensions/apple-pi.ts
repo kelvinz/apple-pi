@@ -24,8 +24,9 @@
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
  *
- * Plan data refreshes when the agent settles, when you change model,
- * and on /usage, but not more than once a minute per provider. Only the
+ * Plan data refreshes when you send a message, after each turn, when the
+ * agent settles, when you change model, and on /usage, but not more than
+ * once a minute per provider. Only the
  * provider behind the current model is fetched, because it is the only one the
  * footer shows. The footer re-renders from a live snapshot on every frame.
  *
@@ -465,7 +466,7 @@ export default function (pi: ExtensionAPI) {
 	// waiting out a gap another provider started.
 	const cache = new Map<string, ProviderStatus>();
 	const lastFetch = new Map<string, number>();
-	const inFlight = new Set<string>();
+	const inFlight = new Map<string, Promise<boolean>>();
 	// Set when the footer is installed. New plan data arrives after the frame
 	// that asked for it, so the screen needs a nudge to show it.
 	let requestRender: () => void = () => {};
@@ -722,11 +723,16 @@ export default function (pi: ExtensionAPI) {
 
 	// Returns true when provider data was actually re-read. Every failure ends as
 	// a note in the footer, so this never rejects: pi must not crash over a
-	// status line.
-	async function fetchProvider(key: string, force: boolean): Promise<boolean> {
-		if (inFlight.has(key)) return false;
-		if (!force && Date.now() - (lastFetch.get(key) ?? 0) < MIN_FETCH_GAP_MS) return false;
-		inFlight.add(key);
+	// status line. The running fetch is kept so a caller can wait for it.
+	function fetchProvider(key: string, force: boolean): Promise<boolean> {
+		if (inFlight.has(key)) return Promise.resolve(false);
+		if (!force && Date.now() - (lastFetch.get(key) ?? 0) < MIN_FETCH_GAP_MS) return Promise.resolve(false);
+		const job = readProvider(key).finally(() => inFlight.delete(key));
+		inFlight.set(key, job);
+		return job;
+	}
+
+	async function readProvider(key: string): Promise<boolean> {
 		let next: ProviderStatus;
 		let failed = false;
 		try {
@@ -736,8 +742,6 @@ export default function (pi: ExtensionAPI) {
 		} catch (e) {
 			next = { rows: [], note: errText(e) };
 			failed = true;
-		} finally {
-			inFlight.delete(key);
 		}
 		// A blip must not erase the last good numbers: keep them, say they are old.
 		const prev = cache.get(key);
@@ -1200,8 +1204,10 @@ export default function (pi: ExtensionAPI) {
 	installAutoResume(pi, async ctx => {
 		const key = ctx.model ? PROVIDER_KEYS[ctx.model.provider] : undefined;
 		if (!key) return undefined;
-		// An in-flight fetch may return the previous cache immediately. Treat
-		// that as unavailable rather than mistaking old data for a fresh reset.
+		// A running fetch (a footer refresh after a turn or a sent message) may have
+		// started before the limit was hit. Let it finish, then fetch again, so
+		// old data is never mistaken for a fresh reset.
+		while (inFlight.has(key)) await inFlight.get(key);
 		return await fetchProvider(key, true) ? cache.get(key) : undefined;
 	});
 
@@ -1236,7 +1242,9 @@ export default function (pi: ExtensionAPI) {
 		if (event.message?.role === "assistant") noteDelta(event.assistantMessageEvent?.type);
 	});
 
-	// User sent a message: refresh footer numbers. A finished reply sets the speed.
+	// User sent a message: refresh footer numbers, and usage too (at most once a
+	// minute), since a window may have reset while idle. A finished reply sets
+	// the speed.
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message?.role === "assistant") {
 			recordSpeed(event.message);
@@ -1245,6 +1253,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (event.message?.role !== "user") return;
 		updateSnapshotAndRender(ctx);
+		void refresh(false);
 	});
 
 	// Run settled: refetch provider data (at most once a minute) and render.
@@ -1255,8 +1264,10 @@ export default function (pi: ExtensionAPI) {
 
 	// Each turn's tokens, cost, and context land in the session here, so the
 	// footer keeps up during a long run instead of waiting for it to settle.
+	// Usage follows too, at most once a minute. The fetch does not hold up the run.
 	pi.on("turn_end", async (_event, ctx) => {
 		updateSnapshotAndRender(ctx);
+		void refresh(false);
 	});
 
 	// Model switch swaps which plan row is shown and the footer's right side.

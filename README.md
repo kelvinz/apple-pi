@@ -115,7 +115,7 @@ Pi must stay running, and the timer waits for Pi to be idle and for extension ap
 
 ## Usage and checks
 
-The footer fetches usage at session start. It also refreshes after the agent settles and when the model changes, at most once a minute per provider. `/usage` forces a refresh. The countdown is recalculated on every footer render; there is no separate timer.
+The footer fetches usage at session start. It also refreshes when you send a message, after each turn of a run, after the agent settles, and when the model changes, at most once a minute per provider. `/usage` forces a refresh. The countdown is recalculated on every footer render; there is no separate timer.
 
 Run the tests from the repository root, across time zones:
 
@@ -126,7 +126,7 @@ TZ=America/New_York pnpm test
 TZ=UTC pnpm test
 ```
 
-The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, output-speed averaging and filtering, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
+The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, the once-a-minute refresh limit, output-speed averaging and filtering, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
 
 They do not cover live provider endpoints, live auto-resume behavior, or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
 

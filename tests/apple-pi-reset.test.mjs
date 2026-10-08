@@ -316,6 +316,27 @@ test("tokens and cost follow each turn without waiting for the run to settle", a
 	assert.ok(text.includes("$0.50"));
 });
 
+test("usage refreshes on sent messages and during a run, at most once a minute", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { events, ctx, requests } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const settle = () => new Promise(resolve => setImmediate(resolve));
+	assert.equal(requests.length, 1);
+	for (let i = 0; i < 5; i++) {
+		clock.t += 10_000;
+		await events.get("turn_end")({}, ctx);
+		await settle();
+	}
+	assert.equal(requests.length, 1);
+	clock.t += 11_000;
+	await events.get("turn_end")({}, ctx);
+	await settle();
+	assert.equal(requests.length, 2);
+	clock.t += 61_000;
+	await events.get("message_end")({ message: { role: "user" } }, ctx);
+	await settle();
+	assert.equal(requests.length, 3);
+});
+
 // Streams one assistant reply: `waitMs` before the first delta, `streamMs` after it.
 async function streamReply(events, ctx, clock, { waitMs = 0, streamMs, usage, delta = "text_delta", stopReason = "stop" }) {
 	const message = { role: "assistant", usage, stopReason };
@@ -813,6 +834,18 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 	await run.events.get("session_shutdown")({}, run.ctx);
 	assert.equal(timers.size, 0);
 	assert.ok(!plainText(run.footer).includes("Auto-resume"));
+});
+
+test("auto-resume: a footer refresh still running at settlement is followed by a fresh fetch", async t => {
+	const clock = { t: now, now: () => clock.t, setTimeout: () => ({ unref() {} }), clearTimeout() {} };
+	const run = await createFooter("openai-codex", plainTheme, 200, true, { mode: "rpc", clock });
+	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
+	// More than a minute after the session-start fetch, so the turn starts a footer refresh.
+	clock.t += 61_000;
+	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: quotaError } }, run.ctx);
+	await run.events.get("turn_end")({}, run.ctx);
+	await run.events.get("agent_settled")({}, run.ctx);
+	assert.equal(run.requests.length, 3, "Session start, the turn's refresh, then a fresh fetch for auto-resume");
 });
 
 test("auto-resume: only long-lived TUI and RPC sessions schedule continuations", async t => {
