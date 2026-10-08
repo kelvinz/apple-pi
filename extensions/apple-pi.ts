@@ -780,41 +780,42 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- output speed (footer) ----------
 
-	// Rolling speed of recent replies, each timed from its first streamed delta
-	// to its end. The wait before that delta is network and queue time, not
-	// output. Short replies (a lone tool call) give noisy numbers, so they are
-	// left out. The average is total tokens over total time, so a long reply
-	// counts for more than a short one.
+	// Estimate received output at four UTF-16 code units per token. Count only
+	// streamed text, thinking (including summaries), and tool-call arguments,
+	// never provider usage totals: those can include unseen reasoning.
+	// Time from the first nonempty delta to message end, excluding initial wait.
+	// Short replies are noisy, so omit them. Weight the last 10 accepted replies
+	// by total estimated tokens over total time, not by averaging their speeds.
 	const MIN_SPEED_MS = 500;
 	const MIN_SPEED_TOKENS = 20;
 	const SPEED_WINDOW = 10;
 	let speedSamples: Array<{ tokens: number; ms: number }> = [];
 	let firstDeltaAt: number | undefined;
-	let sawThinking = false;
+	let streamedChars = 0;
 
 	function clearSpeed(): void {
 		speedSamples = [];
 		stats.tps = undefined;
+		resetSpeedTimer();
 	}
 
 	function resetSpeedTimer(): void {
 		firstDeltaAt = undefined;
-		sawThinking = false;
+		streamedChars = 0;
 	}
 
-	function noteDelta(type: string | undefined): void {
-		if (type !== "text_delta" && type !== "thinking_delta" && type !== "toolcall_delta") return;
+	function noteDelta(event: { type: string; delta?: string } | undefined): void {
+		if (!event || !["text_delta", "thinking_delta", "toolcall_delta"].includes(event.type)) return;
+		if (typeof event.delta !== "string" || !event.delta.length) return;
 		firstDeltaAt ??= Date.now();
-		if (type === "thinking_delta") sawThinking = true;
+		streamedChars += event.delta.length;
 	}
 
 	function recordSpeed(message: AssistantMessage): void {
 		const start = firstDeltaAt;
-		firstDeltaAt = undefined;
+		const tokens = streamedChars / 4;
+		resetSpeedTimer();
 		if (start === undefined || message.stopReason === "error" || message.stopReason === "aborted") return;
-		// Reasoning that was not streamed happened before the first delta, so its
-		// tokens are outside the timed span.
-		const tokens = (num(message.usage?.output) ?? 0) - (sawThinking ? 0 : num(message.usage?.reasoning) ?? 0);
 		const ms = Date.now() - start;
 		if (ms < MIN_SPEED_MS || tokens < MIN_SPEED_TOKENS) return;
 		speedSamples = [...speedSamples, { tokens, ms }].slice(-SPEED_WINDOW);
@@ -977,7 +978,7 @@ export default function (pi: ExtensionAPI) {
 			const model = plainFooterText(s.model);
 			modelInfo.push(providers > 1 && provider ? `(${provider}) ${model}` : model);
 			if (s.thinking) modelInfo.push(`thinking ${plainFooterText(s.thinking)}`);
-			if (s.tps !== undefined) modelInfo.push(`${Math.round(s.tps)} tok/s`);
+			if (s.tps !== undefined) modelInfo.push(`~${Math.round(s.tps)} tok/s`);
 		} else {
 			modelInfo.push("no model");
 		}
@@ -1239,7 +1240,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("message_update", event => {
-		if (event.message?.role === "assistant") noteDelta(event.assistantMessageEvent?.type);
+		if (event.message?.role === "assistant") noteDelta(event.assistantMessageEvent);
 	});
 
 	// User sent a message: refresh footer numbers, and usage too (at most once a

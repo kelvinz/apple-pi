@@ -338,12 +338,12 @@ test("usage refreshes on sent messages and during a run, at most once a minute",
 });
 
 // Streams one assistant reply: `waitMs` before the first delta, `streamMs` after it.
-async function streamReply(events, ctx, clock, { waitMs = 0, streamMs, usage, delta = "text_delta", stopReason = "stop" }) {
+async function streamReply(events, ctx, clock, { waitMs = 0, streamMs, chars = 2400, usage, delta = "text_delta", stopReason = "stop" }) {
 	const message = { role: "assistant", usage, stopReason };
 	await events.get("message_start")({ message }, ctx);
 	clock.t += waitMs;
-	await events.get("message_update")({ message, assistantMessageEvent: { type: delta } }, ctx);
-	await events.get("message_update")({ message, assistantMessageEvent: { type: "text_delta" } }, ctx);
+	await events.get("message_update")({ message, assistantMessageEvent: { type: delta, delta: "a".repeat(chars) } }, ctx);
+	await events.get("message_update")({ message, assistantMessageEvent: { type: "text_delta", delta: "" } }, ctx);
 	clock.t += streamMs;
 	await events.get("message_end")({ message }, ctx);
 }
@@ -353,7 +353,7 @@ test("output speed: timed from the first delta, shown after the model", async ()
 	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
 	assert.ok(!plainText(footer).includes("tok/s"));
 	await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 2000, usage: { output: 600 } });
-	assert.ok(plainText(footer).includes("test · 300 tok/s"));
+	assert.ok(plainText(footer).includes("test · ~300 tok/s"));
 });
 
 test("output speed: short, failed, and aborted replies keep the last good value", async () => {
@@ -361,32 +361,54 @@ test("output speed: short, failed, and aborted replies keep the last good value"
 	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	await streamReply(events, ctx, clock, { streamMs: 100, usage: { output: 600 } });
-	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 10 } });
+	await streamReply(events, ctx, clock, { streamMs: 2000, chars: 40, usage: { output: 10 } });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 100 }, stopReason: "error" });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 100 }, stopReason: "aborted" });
 	assert.ok(plainText(footer).includes("300 tok/s"));
 });
 
-test("output speed: reasoning counts only when it was streamed", async () => {
+test("output speed: Codex summaries count only received text, not hidden reasoning", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
-	await streamReply(events, ctx, clock, { streamMs: 1000, usage: { output: 500, reasoning: 400 } });
-	assert.ok(plainText(footer).includes("100 tok/s"));
-	// 100 + 500 tokens over 2 s.
-	await streamReply(events, ctx, clock, { streamMs: 1000, usage: { output: 500, reasoning: 400 }, delta: "thinking_delta" });
-	assert.ok(plainText(footer).includes("300 tok/s"));
+	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	for (const delta of ["text_delta", "thinking_delta", "toolcall_delta"]) {
+		await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 1000, chars: 400, usage: { output: 5000, reasoning: 4900 }, delta });
+		assert.ok(plainText(footer).includes("~100 tok/s"));
+	}
+	// Provider totals are not needed at all.
+	await streamReply(events, ctx, clock, { streamMs: 1000, chars: 400 });
+	assert.ok(plainText(footer).includes("~100 tok/s"));
 });
 
 test("output speed: the last 10 replies are averaged by tokens over time", async () => {
 	const clock = { t: now, now: () => clock.t };
 	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
-	for (let i = 0; i < 10; i++) await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 200 } });
+	for (let i = 0; i < 10; i++) await streamReply(events, ctx, clock, { streamMs: 2000, chars: 800, usage: { output: 200 } });
 	assert.ok(plainText(footer).includes("100 tok/s"));
 	// (9 × 200 + 600) tokens over 20 s.
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	assert.ok(plainText(footer).includes("120 tok/s"));
 	for (let i = 0; i < 9; i++) await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	assert.ok(plainText(footer).includes("300 tok/s"));
+});
+
+test("output speed: empty and non-output events do not start timing or double-count text", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const message = { role: "assistant", stopReason: "stop" };
+	const update = event => events.get("message_update")({ message, assistantMessageEvent: event }, ctx);
+	await events.get("message_start")({ message }, ctx);
+	await update({ type: "text_delta", delta: "" });
+	await update({ type: "thinking_start" });
+	clock.t += 5000;
+	for (const type of ["thinking_delta", "text_delta", "toolcall_delta"]) {
+		await update({ type, delta: "a".repeat(400) });
+	}
+	await update({ type: "text_end", delta: "a".repeat(1200) });
+	clock.t += 1000;
+	await events.get("message_end")({ message }, ctx);
+	assert.ok(plainText(footer).includes("~300 tok/s"));
+	await streamReply(events, ctx, clock, { streamMs: 1000, chars: 0, usage: { output: 9999 } });
+	assert.ok(plainText(footer).includes("~300 tok/s"), "No received text means no new sample");
 });
 
 test("output speed: a model switch clears the old model's speed", async () => {

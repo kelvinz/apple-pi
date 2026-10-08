@@ -117,6 +117,8 @@ Pi must stay running, and the timer waits for Pi to be idle and for extension ap
 
 The footer fetches usage at session start. It also refreshes when you send a message, after each turn of a run, after the agent settles, and when the model changes, at most once a minute per provider. `/usage` forces a refresh. The countdown is recalculated on every footer render; there is no separate timer.
 
+The footer's `~120 tok/s` is an estimate of how fast content arrives, not the provider's billed token rate. It counts received answer text, thinking text (including summaries), and tool-call arguments at roughly four characters per token. Hidden reasoning is not counted. This estimate varies by language and content. Timing runs from the first nonempty piece of text to the end of the reply, including pauses but excluding the initial wait. The value uses total estimated tokens divided by total time across the last 10 qualifying replies; failed, cancelled, and very short replies are excluded.
+
 Run the tests from the repository root, across time zones:
 
 ```bash
