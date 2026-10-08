@@ -5,7 +5,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 ## Features
 
 - Provider usage for Codex and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. Extra Codex quota windows appear when the provider reports them. A failed refresh keeps the last good numbers and adds a "showing last result" line. Other providers show "no usage endpoint".
-- A footer with the directory, Git branch, session name, token use, cost, context use, model, thinking level, and extension status.
+- A footer with the directory, Git branch, session name, token use, cost, context use, model, thinking level, average output speed of recent replies, and extension status.
 - Small titles above tool calls, assistant replies, and thinking blocks. Built-in tool results and expand/collapse controls stay in place.
 - A **previous message** button above the fullscreen editor.
 - Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks. In Herdr, selected text goes to the clipboard of the computer viewing the chat, including remote chats. No setting is needed.
@@ -126,7 +126,7 @@ TZ=America/New_York pnpm test
 TZ=UTC pnpm test
 ```
 
-The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
+The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, output-speed averaging and filtering, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
 
 They do not cover live provider endpoints, live auto-resume behavior, or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
 

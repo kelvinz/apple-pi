@@ -316,6 +316,66 @@ test("tokens and cost follow each turn without waiting for the run to settle", a
 	assert.ok(text.includes("$0.50"));
 });
 
+// Streams one assistant reply: `waitMs` before the first delta, `streamMs` after it.
+async function streamReply(events, ctx, clock, { waitMs = 0, streamMs, usage, delta = "text_delta", stopReason = "stop" }) {
+	const message = { role: "assistant", usage, stopReason };
+	await events.get("message_start")({ message }, ctx);
+	clock.t += waitMs;
+	await events.get("message_update")({ message, assistantMessageEvent: { type: delta } }, ctx);
+	await events.get("message_update")({ message, assistantMessageEvent: { type: "text_delta" } }, ctx);
+	clock.t += streamMs;
+	await events.get("message_end")({ message }, ctx);
+}
+
+test("output speed: timed from the first delta, shown after the model", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	assert.ok(!plainText(footer).includes("tok/s"));
+	await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 2000, usage: { output: 600 } });
+	assert.ok(plainText(footer).includes("test · 300 tok/s"));
+});
+
+test("output speed: short, failed, and aborted replies keep the last good value", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
+	await streamReply(events, ctx, clock, { streamMs: 100, usage: { output: 600 } });
+	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 10 } });
+	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 100 }, stopReason: "error" });
+	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 100 }, stopReason: "aborted" });
+	assert.ok(plainText(footer).includes("300 tok/s"));
+});
+
+test("output speed: reasoning counts only when it was streamed", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	await streamReply(events, ctx, clock, { streamMs: 1000, usage: { output: 500, reasoning: 400 } });
+	assert.ok(plainText(footer).includes("100 tok/s"));
+	// 100 + 500 tokens over 2 s.
+	await streamReply(events, ctx, clock, { streamMs: 1000, usage: { output: 500, reasoning: 400 }, delta: "thinking_delta" });
+	assert.ok(plainText(footer).includes("300 tok/s"));
+});
+
+test("output speed: the last 10 replies are averaged by tokens over time", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	for (let i = 0; i < 10; i++) await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 200 } });
+	assert.ok(plainText(footer).includes("100 tok/s"));
+	// (9 × 200 + 600) tokens over 20 s.
+	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
+	assert.ok(plainText(footer).includes("120 tok/s"));
+	for (let i = 0; i < 9; i++) await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
+	assert.ok(plainText(footer).includes("300 tok/s"));
+});
+
+test("output speed: a model switch clears the old model's speed", async () => {
+	const clock = { t: now, now: () => clock.t };
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
+	await events.get("model_select")({}, ctx);
+	assert.ok(!plainText(footer).includes("tok/s"));
+});
+
 // reflowText joins rows the transcript wrapped, and nothing else. Room is 20 columns.
 test("reflow joins a forced wrap and keeps rows that could have fit", () => {
 	assert.equal(reflowText("aaaa bbbb cccc dddd\neeee ffff", 20), "aaaa bbbb cccc dddd eeee ffff");

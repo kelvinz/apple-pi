@@ -9,7 +9,8 @@
  *    its own apps, and zai-coding-cn is the China-only plan.
  * 2. A friendlier replacement for the built-in footer: same data (directory,
  *    branch, session name, tokens, cost, context, model, thinking level,
- *    extension statuses) in plain language.
+ *    extension statuses) in plain language, plus the model's average output
+ *    speed over the last 10 replies.
  * 3. A small "→ using <tool> — <path>" title above each tool block when a path
  *    is available. The built-in call and result rendering stay in place, so
  *    expand/collapse is untouched.
@@ -32,7 +33,7 @@
  *   Z.ai    GET https://api.z.ai/api/monitor/usage/quota/limit
  *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (OAuth from /login)
  */
-import type { ExtensionAPI, ExtensionContext, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
 	createBashToolDefinition,
 	createEditToolDefinition,
@@ -91,6 +92,7 @@ type ToolCallRenderer = NonNullable<ToolDefinition["renderCall"]>;
 type ToolCallArgs = Parameters<ToolCallRenderer>[0];
 type ToolCallContext = Parameters<ToolCallRenderer>[2];
 type PartialToolArgs = { path?: unknown; file_path?: unknown };
+type AssistantMessage = Extract<MessageEndEvent["message"], { role: "assistant" }>;
 
 const WARNING_MESSAGES: Record<WarningCategory, string> = {
 	snapshot: "apple-pi snapshot unavailable",
@@ -772,6 +774,50 @@ export default function (pi: ExtensionAPI) {
 		return { tokens, cost };
 	}
 
+	// ---------- output speed (footer) ----------
+
+	// Rolling speed of recent replies, each timed from its first streamed delta
+	// to its end. The wait before that delta is network and queue time, not
+	// output. Short replies (a lone tool call) give noisy numbers, so they are
+	// left out. The average is total tokens over total time, so a long reply
+	// counts for more than a short one.
+	const MIN_SPEED_MS = 500;
+	const MIN_SPEED_TOKENS = 20;
+	const SPEED_WINDOW = 10;
+	let speedSamples: Array<{ tokens: number; ms: number }> = [];
+	let firstDeltaAt: number | undefined;
+	let sawThinking = false;
+
+	function clearSpeed(): void {
+		speedSamples = [];
+		stats.tps = undefined;
+	}
+
+	function resetSpeedTimer(): void {
+		firstDeltaAt = undefined;
+		sawThinking = false;
+	}
+
+	function noteDelta(type: string | undefined): void {
+		if (type !== "text_delta" && type !== "thinking_delta" && type !== "toolcall_delta") return;
+		firstDeltaAt ??= Date.now();
+		if (type === "thinking_delta") sawThinking = true;
+	}
+
+	function recordSpeed(message: AssistantMessage): void {
+		const start = firstDeltaAt;
+		firstDeltaAt = undefined;
+		if (start === undefined || message.stopReason === "error" || message.stopReason === "aborted") return;
+		// Reasoning that was not streamed happened before the first delta, so its
+		// tokens are outside the timed span.
+		const tokens = (num(message.usage?.output) ?? 0) - (sawThinking ? 0 : num(message.usage?.reasoning) ?? 0);
+		const ms = Date.now() - start;
+		if (ms < MIN_SPEED_MS || tokens < MIN_SPEED_TOKENS) return;
+		speedSamples = [...speedSamples, { tokens, ms }].slice(-SPEED_WINDOW);
+		const total = speedSamples.reduce((sum, x) => ({ tokens: sum.tokens + x.tokens, ms: sum.ms + x.ms }), { tokens: 0, ms: 0 });
+		stats.tps = total.tokens / (total.ms / 1000);
+	}
+
 	// ---------- theme ----------
 
 	// A stub theme (print mode, tests) may not carry these, so both are read
@@ -927,6 +973,7 @@ export default function (pi: ExtensionAPI) {
 			const model = plainFooterText(s.model);
 			modelInfo.push(providers > 1 && provider ? `(${provider}) ${model}` : model);
 			if (s.thinking) modelInfo.push(`thinking ${plainFooterText(s.thinking)}`);
+			if (s.tps !== undefined) modelInfo.push(`${Math.round(s.tps)} tok/s`);
 		} else {
 			modelInfo.push("no model");
 		}
@@ -1030,6 +1077,7 @@ export default function (pi: ExtensionAPI) {
 		model?: string;
 		provider?: string;
 		thinking?: string;
+		tps?: number;
 	};
 	const stats: FooterStats = { tokens: 0, cost: 0 };
 
@@ -1166,6 +1214,7 @@ export default function (pi: ExtensionAPI) {
 		warningContext = ctx;
 		sessionActive = true;
 		updateSnapshot(ctx);
+		clearSpeed();
 		installFooter(ctx);
 		installToolHeaders(ctx);
 		if (ctx.mode === "tui") {
@@ -1179,8 +1228,21 @@ export default function (pi: ExtensionAPI) {
 		void refresh(true);
 	});
 
-	// User sent a message: refresh footer numbers.
+	pi.on("message_start", event => {
+		if (event.message?.role === "assistant") resetSpeedTimer();
+	});
+
+	pi.on("message_update", event => {
+		if (event.message?.role === "assistant") noteDelta(event.assistantMessageEvent?.type);
+	});
+
+	// User sent a message: refresh footer numbers. A finished reply sets the speed.
 	pi.on("message_end", async (event, ctx) => {
+		if (event.message?.role === "assistant") {
+			recordSpeed(event.message);
+			requestRender();
+			return;
+		}
 		if (event.message?.role !== "user") return;
 		updateSnapshotAndRender(ctx);
 	});
@@ -1198,7 +1260,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Model switch swaps which plan row is shown and the footer's right side.
+	// The last speed belongs to the old model.
 	pi.on("model_select", async (_event, ctx) => {
+		clearSpeed();
 		updateSnapshotAndRender(ctx);
 		// A different provider may have no data in the cache yet.
 		await refresh(false);
@@ -1218,6 +1282,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		clearSpeed();
 		updateSnapshotAndRender(ctx);
 	});
 
