@@ -10,6 +10,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 - A **previous message** button above the fullscreen editor.
 - Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks. In Herdr, selected text goes to the clipboard of the computer viewing the chat, including remote chats. No setting is needed.
 - Automatic continuation after a subscription usage limit resets, with messages added while waiting included on resume. No settings or enable command.
+- A permission question before shell commands that delete files or discard work, such as `rm`, `git reset --hard`, or `git push --force`. See [Destructive commands](#destructive-commands).
 
 Reset times use the computer's local time zone and a 24-hour clock:
 
@@ -113,6 +114,24 @@ The reset is taken from the error's retry hint and fresh provider usage. If both
 
 Pi must stay running, and the timer waits for Pi to be idle and for extension approval/question dialogs to close. The resumed agent uses your existing tool permissions and may continue executing tools unattended. One-shot print/JSON runs do not schedule continuations.
 
+## Destructive commands
+
+Pi runs tool calls without asking. apple-pi asks you first when a `bash` or `powershell` command could delete files or discard work:
+
+- file deletion: `rm`, `rmdir`, `unlink`, `shred`, `srm`, `truncate`, `dd`, `find -delete`, `find -exec rm`, `rsync --delete`, `Remove-Item`, `ri`, `del`, `erase`, `rd`;
+- Git: `clean`, `reset --hard`, `checkout -- <path>` or `checkout .`, `restore` (except `--staged` only), `switch -f`, `stash drop` or `clear`, `branch -D`, `tag -d`, force or deleting pushes, `rm` (except `--cached`), `worktree remove`, `reflog expire`, `gc --prune`, `update-ref -d`, and history rewrites;
+- disks and services: `sudo`, `doas`, `fdisk`, `mkfs`, `diskutil erase…`, `docker rm`, `rmi`, or `prune`, `kubectl delete`, `terraform destroy`, and SQL `DROP TABLE`, `DROP DATABASE`, or `TRUNCATE TABLE`.
+
+The check also looks inside `bash -c`, `eval`, `xargs`, `$( … )`, subshells, and chained commands. It checks commands after wrappers such as `timeout`, `nice`, `env`, and `watch`, including their common options. Codemode scripts call tools through the same check.
+
+Before the question opens, your current model summarises what the **whole command is attempting to do**, including chained steps and their conditions. For example, `cd app && rm -rf dist && npm run build` should explain moving into `app`, deleting `dist`, and rebuilding if the earlier steps succeed. Only commands flagged as destructive get a summary. The prompt shows the plain-language explanation without a label, then the original command, and offers **Yes**, **No**, and **Type a reply**, without extra help text about these choices. A typed reply stops the command and sends your instructions back to the agent. Closing either question or submitting an empty reply also stops the command. Print and JSON runs cannot ask, so they block these commands. While the question is open, apple-pi sends a `herdr:blocked` event. The tests check this event, but the live Herdr pane display has not been verified.
+
+Each summary adds one model request through Pi's configured model and authentication (Pi 1.3.0's `modelRegistry.streamSimple`, documented in `docs/extensions.md`). It sends the full command and shell tool name, not your chat history or file contents. Command text can contain secrets; those are sent to the selected provider too. Virtual models use their configured routing. This adds latency and provider usage; the guard does not add that usage to the main chat's displayed totals. The summary has no tools and cannot grant permission. It is an AI interpretation, not proof of what will happen.
+
+The summary request has a 15-second limit. Missing models, failed requests, incomplete or empty responses, and commands over 16,000 characters show **Summary unavailable** beside the full command. The guard does not show a guessed or partial summary instead. Cancelling the agent stops the command. Print and JSON runs block without making a summary request.
+
+This check cannot find every command that can cause data loss. It reads text; it does not fully parse shell syntax or all command options. It is not a sandbox: a script or build command that deletes files (`npm run clean`, `make clean`), `mv` or `cp` over an existing file, a `>` redirect, and the `write` and `edit` tools run without a question. For real limits, run Pi in a sandbox or container; see Pi's `docs/security.md`. A command that only mentions one of these words in quotes, such as `grep "rm -rf"`, can ask once more than needed.
+
 ## Usage and checks
 
 The footer fetches usage at session start. It also refreshes when you send a message, after each turn of a run, after the agent settles, and when the model changes, at most once a minute per provider. `/usage` forces a refresh. The countdown is recalculated on every footer render; there is no separate timer.
@@ -128,7 +147,7 @@ TZ=America/New_York pnpm test
 TZ=UTC pnpm test
 ```
 
-The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, the once-a-minute refresh limit, output-speed averaging and filtering, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
+The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, stale data after a failed refresh, the once-a-minute refresh limit, output-speed averaging and filtering, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Guard tests cover which commands ask and which run unasked, the Herdr blocked signal, declined and headless calls, and non-shell tools. Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
 
 They do not cover live provider endpoints, live auto-resume behavior, or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
 

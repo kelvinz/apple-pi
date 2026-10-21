@@ -72,7 +72,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 			throw new Error(`Unexpected import: ${name}`);
 		},
 		Date: class extends Date { static now() { return clock.now?.() ?? now; } },
-		Intl, Buffer, Error, AbortSignal: clock.AbortSignal ?? AbortSignal, setImmediate,
+		Intl, Buffer, Error, AbortController, AbortSignal: clock.AbortSignal ?? AbortSignal, setImmediate,
 		setTimeout: clock.setTimeout ?? setTimeout,
 		clearTimeout: clock.clearTimeout ?? clearTimeout,
 		process: { env },
@@ -911,4 +911,200 @@ test("auto-resume: only long-lived TUI and RPC sessions schedule continuations",
 		await run.emit("agent_settled");
 		assert.equal(run.timers.size, mode === "rpc" ? 1 : 0, mode);
 	}
+});
+
+test("guard: commands that delete files or discard work ask first", () => {
+	const { destructiveReason } = loadExtension();
+	for (const command of [
+		"rm build.log", "rm -rf dist", "/bin/rm -f x", "sudo ls", "rmdir old", "unlink x", "truncate -s 0 log", "dd if=/dev/zero of=disk",
+		"cd src && rm -rf node_modules", "npm test; rm out.txt", "echo $(rm x)", "(rm -rf x)", "if true; then rm x; fi",
+		"timeout 5 rm x", "timeout 30 rm -rf build", "timeout -s TERM 30 rm -rf build", "env -S \"rm x\"", "nice -n 10 env -u FOO rm x", "nice -n 10 rm x", "env -u FOO rm x", "watch -n 5 rm x", "env -- rm x", "nice --adjustment=10 rm x",
+		"FOO=1 env -i nohup rm x", "bash -c 'cd /tmp && rm -rf y'", "sh -lc \"rm x\"", "eval \"rm x\"",
+		"find . -name '*.tmp' -delete", "find . \\( -name a \\) -delete", "find . -exec rm {} \;", "ls | xargs -n 1 rm",
+		"rsync -a --delete src/ dst/", "mkfs.ext4 /dev/sdb1", "diskutil eraseDisk APFS X disk4",
+		"git clean -fdx", "git reset --hard HEAD~1", "git checkout -- src/app.ts", "git checkout .", "git restore src/app.ts",
+		"git switch -f main", "git stash drop", "git stash clear", "git branch -D feature", "git branch -d -f feature",
+		"git tag -d v1", "git push --force origin main", "git push -f", "git push origin --delete old", "git push origin :old",
+		"git push origin +main", "git rm src/a.ts", "git worktree remove ../wt", "git reflog expire --all", "git gc --prune=now",
+		"git -C ../repo reset --hard", "git update-ref -d refs/heads/x", "git filter-branch --tree-filter x",
+		"docker rm -f web", "docker system prune -a", "kubectl delete pod x", "terraform destroy", "psql -c 'DROP TABLE users'",
+		"Remove-Item -Recurse build",
+	]) assert.ok(destructiveReason(command), command);
+});
+
+test("guard: explanations name simple targets without guessing shell expansions", () => {
+	const { destructiveReason } = loadExtension();
+	assert.equal(destructiveReason("rm build.log"), "Deletes build.log.");
+	assert.equal(destructiveReason("rm -rf dist"), "Deletes dist and everything inside it.");
+	assert.equal(destructiveReason("git reset --hard"), "Resets your files to a saved version in Git. Changes that you have not saved can be lost.");
+	assert.equal(destructiveReason("git push origin --delete old"), "Deletes the named branches or tags from the remote server. Other people can lose access to that work.");
+	assert.equal(destructiveReason('rm "$OUTPUT"'), "This command can delete files or folders. You can lose their contents.");
+});
+
+test("guard: ordinary commands, read-only git, and words inside arguments run unasked", () => {
+	const { destructiveReason } = loadExtension();
+	for (const command of [
+		"timeout 30 npm test", "nice -n 10 npm test", "env -u FOO npm test", "watch -n 2 ls",
+		"ls -la", "npm test", "grep -rn rm src", "git status", "git log --oneline", "git diff", "git checkout main",
+		"git checkout -b feature", "git switch main", "git restore --staged src/a.ts", "git branch -d merged", "git push",
+		"git push -u origin feature", "git rm --cached secrets.env", "git clean -n", "git stash", "git commit -m 'remove the old rm helper'",
+		"find . -name '*.ts'", "rsync -a src/ dst/", "docker ps", "kubectl get pods", "echo remove", "cat format.txt",
+		"mv a b", "node scripts/drop-cache.js", "cmd 2>&1 | tee out.log",
+	]) assert.equal(destructiveReason(command), undefined, command);
+});
+
+function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false } = {}) {
+	const extension = loadExtension({}, { status: 200 }, clock);
+	const handlers = new Map();
+	const signals = [];
+	const asked = [];
+	const summaries = [];
+	const pi = { on: (event, handler) => handlers.set(event, handler), events: { emit: (channel, data) => signals.push([channel, data]) } };
+	extension.installDestructiveGuard(pi);
+	const ctx = {
+		hasUI, model, signal,
+		modelRegistry: {
+			streamSimple: (selected, context, options) => {
+				summaries.push({ selected, context, options });
+				return { result: async () => {
+					if (summaryError) throw summaryError;
+					if (pending) return new Promise(() => {});
+					return { stopReason, content: [{ type: "text", text: summary }] };
+				} };
+			},
+		},
+		ui: {
+			input: async (title) => {
+				assert.equal(title, "What should the agent do instead?");
+				assert.equal(signals.at(-1)[1].active, true);
+				if (inputError) throw inputError;
+				return reply;
+			},
+			select: async (title, options) => {
+				asked.push([title, options]);
+				// The blocked signal is active while the question is open.
+				assert.deepEqual(asPlain(signals.at(-1)), ["herdr:blocked", { active: true, label: "permission: Allow this command?" }]);
+				if (confirmError) throw confirmError;
+				return answer === null ? undefined : answer;
+			},
+		},
+	};
+	const call = (toolName, input) => handlers.get("tool_call")({ toolName, input }, ctx);
+	return { call, signals, asked, summaries };
+}
+
+test("guard: an allowed command runs and clears the blocked signal", async () => {
+	const run = guardRun({ answer: "Yes" });
+	assert.equal(await run.call("bash", { command: "rm -rf dist" }), undefined);
+	assert.deepEqual(asPlain(run.asked), [["Allow this command?\n\nDelete the dist folder and its contents.\n\nCommand:\nrm -rf dist", ["Yes", "No", "Type a reply"]]]);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard: summarises the whole command with the current model and no tools", async () => {
+	const command = "cd app && rm -rf dist && npm run build";
+	const summary = "Go to app, delete dist, then build the app if each earlier step succeeds.";
+	const run = guardRun({ summary });
+	await run.call("bash", { command });
+	assert.equal(run.asked[0][0], `Allow this command?\n\n${summary}\n\nCommand:\n${command}`);
+	assert.equal(run.summaries.length, 1);
+	const request = run.summaries[0];
+	assert.equal(request.selected.id, "test-model");
+	assert.deepEqual(asPlain(JSON.parse(request.context.messages[0].content)), { shell: "bash", command });
+	assert.equal(request.context.messages.length, 1);
+	assert.equal(request.context.tools, undefined);
+	assert.match(request.context.systemPrompt, /entire command/);
+	assert.match(request.context.systemPrompt, /untrusted data/);
+	assert.ok(request.options.maxTokens <= 1024);
+});
+
+test("guard: failed or incomplete summaries do not become approval or a misleading fallback", async () => {
+	for (const options of [
+		{ summaryError: new Error("offline") }, { summary: "" }, { stopReason: "length" },
+		{ stopReason: "error" }, { stopReason: "toolUse" }, { summary: "x".repeat(2401) },
+		{ summary: "\u001b[2Jhidden" }, { model: null },
+	]) {
+		const run = guardRun({ ...options, answer: "No" });
+		assert.equal((await run.call("bash", { command: "rm x" })).block, true);
+		assert.equal(run.asked[0][0], "Allow this command?\n\nSummary unavailable. Read the full command before you decide.\n\nCommand:\nrm x");
+	}
+});
+
+test("guard: a summary timeout aborts the request even when the provider never returns", async () => {
+	let expire;
+	let cleared = false;
+	const run = guardRun({ pending: true, answer: "No", clock: {
+		setTimeout: (fn, ms) => { assert.equal(ms, 15000); expire = fn; return 123; },
+		clearTimeout: id => { assert.equal(id, 123); cleared = true; },
+	} });
+	const call = run.call("bash", { command: "rm x" });
+	expire();
+	assert.equal((await call).block, true);
+	assert.equal(run.summaries[0].options.signal.aborted, true);
+	assert.equal(cleared, true);
+	assert.match(run.asked[0][0], /Summary unavailable/);
+});
+
+test("guard: cancelling during a summary stops the command without opening a question", async () => {
+	const controller = new AbortController();
+	const run = guardRun({ pending: true, signal: controller.signal });
+	const call = run.call("bash", { command: "rm x" });
+	controller.abort();
+	assert.equal((await call).block, true);
+	assert.equal(run.asked.length, 0);
+	assert.equal(run.signals.at(-1)[1].active, false);
+});
+
+test("guard: long commands are not sent as misleading partial summaries", async () => {
+	const run = guardRun({ answer: "No" });
+	const command = "rm " + "x".repeat(16000);
+	assert.equal((await run.call("bash", { command })).block, true);
+	assert.equal(run.summaries.length, 0);
+	assert.ok(run.asked[0][0].endsWith(command));
+});
+
+test("guard: a failed question clears the blocked signal without allowing the command", async () => {
+	const run = guardRun({ confirmError: new Error("dialog closed") });
+	await assert.rejects(run.call("bash", { command: "rm x" }), /dialog closed/);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard: a typed reply stops the command and reaches the agent", async () => {
+	const run = guardRun({ answer: "Type a reply", reply: "Keep dist. Delete only the log." });
+	const result = await run.call("bash", { command: "rm -rf dist" });
+	assert.equal(result.block, true);
+	assert.match(result.reason, /User reply:\nKeep dist\. Delete only the log\./);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard: a failed reply clears the blocked signal", async () => {
+	const run = guardRun({ answer: "Type a reply", inputError: new Error("input closed") });
+	await assert.rejects(run.call("bash", { command: "rm x" }), /input closed/);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard: cancelled selections and empty replies never allow the command", async () => {
+	for (const options of [{ answer: null }, { answer: "Type a reply" }, { answer: "Type a reply", reply: "   " }]) {
+		const run = guardRun(options);
+		assert.equal((await run.call("bash", { command: "rm x" })).block, true);
+	}
+});
+
+test("guard: a declined command is blocked and tells the model to ask the user", async () => {
+	const run = guardRun({ answer: "No" });
+	const result = await run.call("bash", { command: "git reset --hard" });
+	assert.equal(result.block, true);
+	assert.match(result.reason, /Command stopped\. Resets your files to a saved version in Git\..*Ask the user/);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard: print and JSON runs block without asking; safe and non-shell calls pass untouched", async () => {
+	const headless = guardRun({ hasUI: false });
+	assert.equal((await headless.call("bash", { command: "rm x" })).block, true);
+	assert.equal(headless.asked.length + headless.signals.length + headless.summaries.length, 0);
+	const run = guardRun();
+	assert.equal(await run.call("bash", { command: "npm test" }), undefined);
+	assert.equal(await run.call("write", { path: "rm", content: "rm -rf /" }), undefined);
+	assert.equal(run.summaries.length, 0);
+	assert.equal((await run.call("powershell", { command: "Remove-Item x" })), undefined);
+	assert.equal(run.asked.length, 1);
 });
