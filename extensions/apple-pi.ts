@@ -20,6 +20,7 @@
  * 6. Fullscreen copy joins lines that the transcript wrapped at its width, so
  *    a copied paragraph pastes as one line. Intentional breaks stay. Inside
  *    Herdr, selections go through the terminal to the viewing computer's clipboard.
+ *    Shutdown restores Pi's normal copying.
  * 7. Usage-limit errors automatically resume after reset + one minute.
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
@@ -176,13 +177,19 @@ export function reflowText(text: string, room: number, pad = 0, startCol = 0): s
 }
 
 const ORIGINAL_COPY = Symbol.for("apple-pi.copySelection");
+const COPY_PATCH = Symbol.for("apple-pi.copyPatch");
 // Same encoded-payload ceiling as Pi's built-in terminal clipboard writer.
 const MAX_CLIPBOARD_BASE64_LENGTH = 100_000;
 type CopySelection = (text: string) => Promise<boolean | string>;
+// Plain object on purpose: Pi's forwarding Proxy returns every function
+// property as a fresh closure, but passes non-function values through, so this
+// state is readable and comparable even through the Proxy.
+type CopyPatchState = { token: object; original: CopySelection; receiver: unknown; wrapper: CopySelection; identityHolds: boolean };
 // Pi exposes no public copy hook. These fields exist on the fullscreen TUI only.
 type CopyTui = {
 	copySelection?: CopySelection;
 	[ORIGINAL_COPY]?: CopySelection;
+	[COPY_PATCH]?: CopyPatchState;
 	getSelectionBounds?: () => { start: { col: number; scrollView?: unknown } } | undefined;
 	currentLayout?: { root: TranscriptLayoutBox };
 };
@@ -195,13 +202,24 @@ type CopyTui = {
  * so Pi may otherwise report success from writing only the remote clipboard.
  * Route selections through Herdr's terminal forwarding instead, for both local
  * and remote panes. Leave Pi's native route unchanged outside Herdr.
+ *
+ * Returns an idempotent cleanup that restores the previous callback, so
+ * removing the extension cannot leave this copy behavior installed (Pi reuses
+ * its renderer across a same-mode reload). Cleanup never overwrites a newer
+ * apple-pi patch, and on a raw TUI it leaves another extension's callback in
+ * place; through Pi's forwarding Proxy function identity cannot be read, so
+ * ownership there is the recorded patch state.
  */
-export function patchCopyReflow(tui: TUI, outputPad: () => number): void {
+export function patchCopyReflow(tui: TUI, outputPad: () => number): () => void {
 	const t = tui as unknown as CopyTui;
-	const original = t[ORIGINAL_COPY] ?? t.copySelection;
-	if (typeof original !== "function") return;
-	t[ORIGINAL_COPY] = original;
-	t.copySelection = async text => {
+	// An earlier apple-pi patch still holds the pristine callback; chain to it,
+	// never to another apple-pi wrapper.
+	const previous = t[COPY_PATCH];
+	const original = previous?.original ?? t[ORIGINAL_COPY] ?? t.copySelection;
+	if (typeof original !== "function") return () => {};
+	const receiver = t;
+	const state: CopyPatchState = { token: {}, original, receiver, wrapper: undefined!, identityHolds: false };
+	state.wrapper = async text => {
 		let copied = text;
 		try {
 			// Only selections in a scroll view (the transcript) have a known wrap width.
@@ -230,7 +248,33 @@ export function patchCopyReflow(tui: TUI, outputPad: () => number): void {
 				return "Could not send the selection to your terminal clipboard.";
 			}
 		}
-		return original(copied);
+		// Keep the original callback's receiver, not this wrapper's caller's.
+		return original.call(receiver, copied);
+	};
+	t[COPY_PATCH] = state;
+	t[ORIGINAL_COPY] = original;
+	t.copySelection = state.wrapper;
+	// A raw TUI reads the installed function back unchanged; Pi's forwarding
+	// Proxy returns a fresh closure for every function read.
+	state.identityHolds = t.copySelection === state.wrapper;
+	let done = false;
+	return () => {
+		if (done) return;
+		done = true;
+		// A newer apple-pi installation owns the callback now: leave it alone.
+		if (t[COPY_PATCH] !== state) return;
+		t[COPY_PATCH] = undefined;
+		if (state.identityHolds) {
+			// Raw TUI: restore only while our wrapper is still the installed
+			// callback, so another extension's replacement survives our cleanup.
+			if (t.copySelection === state.wrapper) t.copySelection = original;
+		} else {
+			// Forwarding Proxy: function identity cannot be compared there. The
+			// patch state above says apple-pi still owns the slot; widget
+			// factories reinstall after a reload, so anything layered later by
+			// another extension re-installs itself too.
+			t.copySelection = original;
+		}
 	};
 }
 
@@ -1486,9 +1530,14 @@ export default function (pi: ExtensionAPI) {
 		return await fetchProvider(key, true) ? cache.get(key) : undefined;
 	});
 
+	let copyCleanup: (() => void) | undefined;
 	pi.on("session_shutdown", () => {
 		sessionActive = false;
 		warningContext = undefined;
+		// Pi reuses its renderer across a same-mode reload, so removing apple-pi
+		// must restore normal copying itself.
+		copyCleanup?.();
+		copyCleanup = undefined;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1501,7 +1550,9 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.mode === "tui") {
 			// This widget factory is also the only way to receive the live TUI.
 			ctx.ui.setWidget("apple-pi-previous-message", (tui, theme) => {
-				patchCopyReflow(tui, outputPad);
+				// A repeated factory call replaces the earlier installation first.
+				copyCleanup?.();
+				copyCleanup = patchCopyReflow(tui, outputPad);
 				return createPreviousMessageWidget(tui, theme, () => ctx.ui.notify("Previous-message navigation is unavailable in this Pi layout.", "warning"));
 			}, { placement: "aboveEditor" });
 		}

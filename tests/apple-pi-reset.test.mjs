@@ -633,6 +633,116 @@ test("chat copy: session startup installs the local-clipboard route on the live 
 	}
 });
 
+test("copy cleanup: cleanup restores the native callback exactly once", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Reflowed while installed");
+	cleanup();
+	assert.equal(copyTui.copySelection, native, "The native callback itself is back");
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[1], " aaaa bbbb cccc dddd\n eeee", "Native copying is untouched after cleanup");
+	// Repeated cleanup cannot clobber a patch installed by someone else later.
+	const laterPatch = async text => native(text);
+	copyTui.copySelection = laterPatch;
+	cleanup();
+	assert.equal(copyTui.copySelection, laterPatch, "A later callback by another extension survives");
+});
+
+test("copy cleanup: install, cleanup, and reinstall keep working", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const first = patchCopyReflow(copyTui, () => 1);
+	first();
+	patchCopyReflow(copyTui, () => 1)();
+	assert.equal(copyTui.copySelection, native, "Nothing stays installed after both cleanups");
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "A reinstall after cleanup reflows again");
+	cleanup();
+	assert.equal(copyTui.copySelection, native);
+});
+
+test("copy cleanup: an older patch's cleanup leaves a newer patch installed", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const older = patchCopyReflow(copyTui, () => 1);
+	const newer = patchCopyReflow(copyTui, () => 1);
+	older(); // A reload replaced the older patch; its cleanup must not restore yet.
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "The newer patch still reflows");
+	assert.notEqual(copyTui.copySelection, native);
+	newer();
+	assert.equal(copyTui.copySelection, native, "The newest patch's cleanup restores native copying");
+});
+
+test("copy cleanup: another extension's replacement survives cleanup on a raw TUI", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	const applePiWrapper = copyTui.copySelection;
+	const seenByOther = [];
+	copyTui.copySelection = async text => { seenByOther.push(text); return applePiWrapper(text); };
+	cleanup();
+	assert.notEqual(copyTui.copySelection, native, "The other extension's callback stays installed");
+	assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee"), true);
+	assert.deepEqual(seenByOther, [" aaaa bbbb cccc dddd\n eeee"]);
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Its chain through apple-pi's wrapper still works");
+});
+
+test("copy cleanup: unsupported layouts return a no-op cleanup", () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const copyTui = { terminal: { write() {} } };
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	assert.equal(copyTui.copySelection, undefined);
+	assert.doesNotThrow(cleanup);
+	assert.equal(copyTui.copySelection, undefined);
+});
+
+test("copy cleanup: Pi's real forwarding TUI reference restores native copying", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const piRoot = realpathSync(installedPackage);
+	const { createInteractiveTuiReference } = await import(new URL("./dist/modes/interactive/tui-renderer.js", pathToFileURL(piRoot)));
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	// Every function read through this reference yields a fresh closure, so
+	// function identity cannot be compared through it.
+	const reference = createInteractiveTuiReference(() => copyTui);
+	const cleanup = patchCopyReflow(reference, () => 1);
+	assert.notEqual(reference.copySelection, native);
+	await reference.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Reflow works through the reference");
+	cleanup();
+	assert.notEqual(copyTui.copySelection, undefined);
+	// Through the reference the restored callback is a fresh forwarding closure,
+	// so identity cannot be compared; its behavior must be exactly native.
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[1], " aaaa bbbb cccc dddd\n eeee", "Native copying is restored through the reference");
+	assert.equal(nativeCopies.length, 2, "No second reflowing copy happened");
+});
+
+test("copy cleanup: shutdown restores native copying, and a reload with apple-pi reinstalls one patch", async () => {
+	const { copyTui, nativeCopies } = copyFixture();
+	const run = await createFooter("anthropic", plainTheme, 200, true, { mode: "tui", copyTui, env: {} });
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Installed at session start");
+	await run.events.get("session_shutdown")({}, run.ctx);
+	// Removing apple-pi, then /reload without it: normal copying stays.
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[1], " aaaa bbbb cccc dddd\n eeee", "Shutdown restored native copying");
+	// A reload with apple-pi still installed reinstalls exactly one patch.
+	await run.events.get("session_start")({}, run.ctx);
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[2], "aaaa bbbb cccc dddd eeee", "One fresh patch, not a stack");
+	await run.events.get("session_shutdown")({}, run.ctx);
+	assert.equal(copyTui.copySelection.constructor, copyFixture().copyTui.copySelection.constructor, "Native again after the second shutdown");
+});
+
 const quotaError = "You have hit your ChatGPT usage limit (plus plan). Try again in ~22 min.";
 const asPlain = value => JSON.parse(JSON.stringify(value));
 
