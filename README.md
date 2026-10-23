@@ -27,12 +27,12 @@ Do these steps in order on each computer. Pi loads the repository in place: `pi 
 
 ### 1. Check the requirements
 
-Git, Node.js 22.19 or later, pnpm, and `@earendil-works/pi-coding-agent` (the upstream package, checked with Pi 1.0.0). Pi supplies the extension's runtime dependencies, so the repository needs no build step.
+Git, Node.js 22.19 or later, pnpm, and `@earendil-works/pi-coding-agent` (the upstream package, checked with Pi 1.3.0; the tool-title renderer resolver needs its `registerToolRenderer` API). Pi supplies the extension's runtime dependencies, so the repository needs no build step.
 
 Run `pi --version`. If Pi is missing, install the tested version:
 
 ```bash
-pnpm add -g @earendil-works/pi-coding-agent@1.0.0
+pnpm add -g @earendil-works/pi-coding-agent@1.3.0
 ```
 
 ### 2. Clone the repository
@@ -147,7 +147,7 @@ TZ=America/New_York pnpm test
 TZ=UTC pnpm test
 ```
 
-The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, Z.ai credential resolution through Pi's registry (including missing and failing credentials and a provider switch during a pending resolution), stale data after a failed refresh, the once-a-minute refresh limit, output-speed averaging and filtering, tool registration with Pi's settings, and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Copy-cleanup tests cover restoring native copying on shutdown and removal, including through Pi's real forwarding TUI reference. Guard tests cover which commands ask and which run unasked, the Herdr blocked signal, declined and headless calls, non-shell tools, and the one-question-at-a-time queue for concurrent calls (including Pi's real extension selector displacing an open one). Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
+The tests use the jiti compiler and TUI helpers from a global `@earendil-works/pi-coding-agent` (found through `pnpm root -g` or `npm root -g`; set `PI_PACKAGE_DIR` for another location). Credentials and HTTP responses are mocked, so no provider requests happen. They cover reset formats, footer widths, both providers, Z.ai credential resolution through Pi's registry (including missing and failing credentials and a provider switch during a pending resolution), stale data after a failed refresh, the once-a-minute refresh limit, output-speed averaging and filtering, the tool-title renderer resolver (checked against Pi's real extension loader and tool merge, so registered tools are never replaced), and the copy reflow rules. Clipboard tests cover Herdr routing without SSH variables, UTF-8 encoding, size limits, write errors, reloads, and Pi's real selection-copy action with a simulated terminal. Copy-cleanup tests cover restoring native copying on shutdown and removal, including through Pi's real forwarding TUI reference. Guard tests cover which commands ask and which run unasked, the Herdr blocked signal, declined and headless calls, non-shell tools, and the one-question-at-a-time queue for concurrent calls (including Pi's real extension selector displacing an open one). Fake-clock auto-resume tests cover the reset buffer, weekly windows, queued text/images and their provider-context conversion, sleep/wake, unknown-reset backoff, approval dialogs, and timer cleanup (including closing during a pending fetch).
 
 They do not cover live provider endpoints, live auto-resume behavior, or mouse and copy behavior in a terminal. Fullscreen navigation and copy rely on internal Pi layout fields and may break after a Pi update. Check these by hand:
 

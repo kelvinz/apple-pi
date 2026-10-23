@@ -29,33 +29,15 @@ const resetAt = new Date(2030, 9, 6, 18, 30).getTime();
 const now = resetAt - (3 * 3600 + 42 * 60) * 1000;
 const hour = 3600;
 const day = 24 * hour;
-// Set to make the mocked SettingsManager fail, as a locked settings file would.
-const settingsFailure = { on: false };
 
 // `state.status` is the HTTP status every mocked request returns; tests change it mid-run.
 function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env = {}) {
 	const exports = {};
 	const requests = [];
-	const toolCalls = {};
-	const settingsCalls = [];
 	const sentHeaders = [];
 	const piModule = {
 		getAgentDir: () => "/mock-agent",
 		UserMessageComponent: class {},
-		SettingsManager: {
-			create: (cwd, agentDir, options) => {
-				settingsCalls.push({ cwd, agentDir, options });
-				if (settingsFailure.on) throw new Error("ELOCKED");
-				return { getImageAutoResize: () => false, getShellCommandPrefix: () => "set -e", getShellPath: () => "/bin/zsh" };
-			},
-		},
-		...Object.fromEntries(["Bash", "Edit", "Find", "Grep", "Ls", "PowerShell", "Read", "Write"].map(name => [
-			`create${name}ToolDefinition`,
-			(cwd, options) => {
-				toolCalls[name.toLowerCase()] = { cwd, options };
-				return { renderCall() {} };
-			},
-		])),
 	};
 	runInNewContext(compiled, {
 		exports,
@@ -88,7 +70,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 		},
 	});
 	assert.equal(exports.__JITI_ERROR__, undefined, "The extension must compile");
-	return { ...exports, requests, toolCalls, settingsCalls, sentHeaders };
+	return { ...exports, requests, sentHeaders };
 }
 
 const { formatReset, reflowText } = loadExtension();
@@ -157,7 +139,7 @@ const fixtures = {
 	},
 };
 
-async function createFooter(provider, theme, status = 200, projectTrusted = true, options = {}) {
+async function createFooter(provider, theme, status = 200, options = {}) {
 	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
 	const state = { status };
@@ -165,6 +147,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	const events = new Map();
 	const commands = new Map();
 	const tools = [];
+	const toolRenderers = [];
 	const prompts = [];
 	const entries = [];
 	const statuses = new Map();
@@ -178,6 +161,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 			} : handler);
 		},
 		registerTool: tool => tools.push(tool),
+		registerToolRenderer: resolver => toolRenderers.push(resolver),
 		registerCommand: (name, command) => commands.set(name, command),
 		registerMarkdownTransformer() {},
 		events: { emit() {} },
@@ -187,7 +171,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	const notices = [];
 	const apiKeyCalls = [];
 	const ctx = {
-		mode: options.mode ?? "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted, isIdle: () => true,
+		mode: options.mode ?? "print", cwd: "/mock", hasUI: true, isIdle: () => true,
 		model: { id: "test", provider },
 		modelRegistry: {
 			getApiKeyForProvider: async requested => {
@@ -218,7 +202,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(extension.requests.length, options.expectRequests ?? (fixture ? 1 : 0));
-	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, prompts, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests, sentHeaders: extension.sentHeaders, apiKeyCalls };
+	return { footer, fixture, events, commands, ctx, entries, state, tools, toolRenderers, notices, prompts, requests: extension.requests, sentHeaders: extension.sentHeaders, apiKeyCalls };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
@@ -275,7 +259,7 @@ test("Codex: a ten-second timeout keeps cached usage and a successful retry clea
 		signal = new AbortController();
 		return signal.signal;
 	} } };
-	const { footer, commands, ctx, state } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const { footer, commands, ctx, state } = await createFooter("openai-codex", plainTheme, 200, { clock });
 	assert.ok(plainText(footer).includes("75% left"));
 	state.beforeResponse = ({ signal }) => new Promise((resolve, reject) => {
 		signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -316,7 +300,7 @@ test("zai: a failed refresh keeps the last good rows and says they are old", asy
 // Z.ai credentials come from Pi's resolver, so saved references work and the
 // stored reference text itself is never sent to the provider.
 test("zai auth: a resolved literal key is sent as the bearer token", async () => {
-	const run = await createFooter("zai", plainTheme, 200, true, { zaiApiKey: "resolved-literal-key" });
+	const run = await createFooter("zai", plainTheme, 200, { zaiApiKey: "resolved-literal-key" });
 	assert.ok(plainText(run.footer).includes("100% left"));
 	assert.deepEqual(run.apiKeyCalls, ["zai"], "The key is asked from Pi's registry, for zai only");
 	assert.equal(run.sentHeaders.length, 1);
@@ -326,7 +310,7 @@ test("zai auth: a resolved literal key is sent as the bearer token", async () =>
 
 test("zai auth: environment references and credential commands resolve through Pi", async () => {
 	for (const resolved of ["env-resolved-key", "command-resolved-key"]) {
-		const run = await createFooter("zai", plainTheme, 200, true, { zaiApiKey: resolved });
+		const run = await createFooter("zai", plainTheme, 200, { zaiApiKey: resolved });
 		assert.equal(run.sentHeaders[0].headers.authorization, `Bearer ${resolved}`);
 		// The unresolved reference stored in auth.json is never the token.
 		assert.ok(run.sentHeaders.every(sent => !JSON.stringify(sent.headers).includes("ZAI_API_KEY")));
@@ -334,7 +318,7 @@ test("zai auth: environment references and credential commands resolve through P
 });
 
 test("zai auth: missing credentials mean no request and a not-set-up note", async () => {
-	const run = await createFooter("zai", plainTheme, 200, true, { zaiApiKey: null, expectRequests: 0 });
+	const run = await createFooter("zai", plainTheme, 200, { zaiApiKey: null, expectRequests: 0 });
 	assert.equal(run.requests.length, 0);
 	assert.deepEqual(run.apiKeyCalls, ["zai"]);
 	assert.ok(plainText(run.footer).includes("zai"), "The provider is still named");
@@ -343,7 +327,7 @@ test("zai auth: missing credentials mean no request and a not-set-up note", asyn
 
 test("zai auth: a failing resolver keeps the last good rows as stale", async () => {
 	const options = { zaiApiKey: "good-key" };
-	const run = await createFooter("zai", plainTheme, 200, true, options);
+	const run = await createFooter("zai", plainTheme, 200, options);
 	assert.ok(plainText(run.footer).includes("100% left"));
 	options.zaiApiKey = new Error("credential command failed");
 	await run.commands.get("usage").handler("", run.ctx);
@@ -360,7 +344,7 @@ test("zai auth: a key Pi stops resolving replaces the rows with a not-set-up not
 	// Pi 1.3.0's getApiKeyForProvider catches resolution errors and returns
 	// undefined, so a failing credential command arrives here as no key.
 	const options = { zaiApiKey: "good-key" };
-	const run = await createFooter("zai", plainTheme, 200, true, options);
+	const run = await createFooter("zai", plainTheme, 200, options);
 	assert.ok(plainText(run.footer).includes("100% left"));
 	options.zaiApiKey = null;
 	await run.commands.get("usage").handler("", run.ctx);
@@ -374,7 +358,7 @@ test("zai auth: a provider switch during a pending resolution caches under the r
 	let resolveZai;
 	const options = { zaiApiKey: new Promise(resolve => { resolveZai = resolve; }) };
 	const codexFixture = fixtures["openai-codex"];
-	const run = await createFooter("zai", plainTheme, 200, true, {
+	const run = await createFooter("zai", plainTheme, 200, {
 		...options,
 		expectRequests: 0,
 		responses: { [codexFixture.url]: codexFixture.response },
@@ -403,32 +387,125 @@ test("providers without a usage endpoint make no request", async () => {
 	}
 });
 
-test("built-in tools are re-registered with the user's Pi settings", async () => {
-	const { tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
-	const toolCalls = JSON.parse(JSON.stringify(realmCalls)); // the mock runs in another vm realm
-	assert.equal(tools.length, 8);
-	assert.deepEqual(toolCalls.bash, { cwd: "/mock", options: { commandPrefix: "set -e", shellPath: "/bin/zsh" } });
-	assert.deepEqual(toolCalls.read, { cwd: "/mock", options: { autoResizeImages: false } });
-	assert.deepEqual(toolCalls.edit, { cwd: "/mock" });
+// A plain render context for tool renderers: lastComponent is the slot's previous component.
+function renderContext(overrides = {}) {
+	return { args: {}, toolCallId: "call-1", invalidate() {}, lastComponent: undefined, state: {}, cwd: "/mock", executionStarted: false, ...overrides };
+}
+const headerLine = component => component.render(100).map(line => tui.stripTerminalSequences(line).trim());
+
+test("tool headers: no tools are registered; one resolver decorates only named tools that render calls", async () => {
+	const run = await createFooter("zai", plainTheme);
+	assert.equal(run.tools.length, 0, "registerTool is never called");
+	assert.equal(run.toolRenderers.length, 1, "Exactly one renderer resolver");
+	const resolver = run.toolRenderers[0];
+	const base = { renderCall() {}, renderResult() {}, renderShell() {} };
+	assert.notEqual(resolver("bash", () => base).renderCall, base.renderCall, "bash is decorated");
+	assert.notEqual(resolver("powershell", () => base).renderCall, base.renderCall, "powershell is decorated");
+	assert.equal(resolver("mcp__server__tool", () => base), base, "Other tools pass through as the same object");
+	const noCall = { renderResult: base.renderResult, renderShell: base.renderShell };
+	assert.equal(resolver("bash", () => noCall), noCall, "No call renderer below means no decoration");
+	assert.equal(resolver("bash", () => undefined), undefined, "Tools without renderers stay unknown");
 });
 
-test("project settings reach the built-in tools only when Pi trusts the project", async () => {
-	for (const trusted of [true, false]) {
-		const { settingsCalls } = await createFooter("zai", plainTheme, 200, trusted);
-		assert.deepEqual(JSON.parse(JSON.stringify(settingsCalls)), [{ cwd: "/mock", agentDir: "/mock-agent", options: { projectTrusted: trusted } }]);
-	}
+test("tool headers: the renderer below is called, and result and shell rendering pass through unchanged", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const seen = [];
+	const inner = new tui.Text("$ echo hi", 0, 0);
+	const renderResult = () => "result";
+	const renderShell = () => "shell";
+	const wrapped = resolver("bash", () => ({
+		renderCall(args, theme, context) { seen.push({ args, theme, context }); return inner; },
+		renderResult,
+		renderShell,
+	}));
+	assert.equal(wrapped.renderResult, renderResult, "Result rendering is the same function");
+	assert.equal(wrapped.renderShell, renderShell, "Shell rendering is the same function");
+	const args = { command: "echo hi" };
+	const context = renderContext();
+	const lines = headerLine(wrapped.renderCall(args, plainTheme, context));
+	assert.deepEqual(seen.map(call => call.args), [args], "The renderer below sees the same arguments");
+	assert.equal(seen[0].theme, plainTheme);
+	assert.equal(seen[0].context.lastComponent, undefined, "No previous component stays undefined");
+	assert.deepEqual(lines, ["→ using bash", "$ echo hi"]);
 });
 
-test("a settings read failure warns and still registers the tools without settings", async () => {
-	settingsFailure.on = true;
-	try {
-		const { notices, tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
-		assert.deepEqual(notices, [["apple-pi registration unavailable", "warning"]]);
-		assert.equal(tools.length, 8);
-		assert.deepEqual(JSON.parse(JSON.stringify(realmCalls)).bash, { cwd: "/mock" });
-	} finally {
-		settingsFailure.on = false;
+test("tool headers: titles escape control characters in paths", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const wrapped = resolver("read", () => ({ renderCall: () => new tui.Text("body", 0, 0) }));
+	const lines = headerLine(wrapped.renderCall({ path: "a\u001bb\u007fc" }, plainTheme, renderContext()));
+	assert.deepEqual(lines, ["→ using read — a\\u001bb\\u007fc", "body"]);
+});
+
+test("tool headers: the renderer below receives its own previous inner component", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const seen = [];
+	const wrapped = resolver("edit", () => ({ renderCall: (args, theme, context) => { seen.push(context.lastComponent); return new tui.Text("edit", 0, 0); } }));
+	// A previous render's wrapper: header above, the renderer's own component below.
+	const previousInner = new tui.Text("previous inner", 0, 0);
+	const previous = new tui.Container();
+	previous.addChild(new tui.Text("→ using edit", 0, 0));
+	previous.addChild(previousInner);
+	wrapped.renderCall({ file_path: "a.ts" }, plainTheme, renderContext({ lastComponent: previous }));
+	wrapped.renderCall({ file_path: "a.ts" }, plainTheme, renderContext({ lastComponent: previousInner }));
+	assert.deepEqual(seen, [previousInner, undefined], "Only the wrapper's second child is reused; foreign components are not");
+});
+
+test("tool headers: a renderer below that throws keeps the header and warns once", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const wrapped = resolver("write", () => ({ renderCall() { throw new Error("renderer changed"); } }));
+	for (let i = 0; i < 2; i++) {
+		const lines = headerLine(wrapped.renderCall({ path: "out.txt" }, plainTheme, renderContext()));
+		assert.deepEqual(lines, ["→ using write — out.txt"], "The header alone still shows");
 	}
+	await new Promise(resolve => setImmediate(resolve));
+	assert.deepEqual(run.notices, [["apple-pi tool renderer unavailable", "warning"]]);
+});
+
+test("tool headers: a remote tool loaded before or after apple-pi keeps its execute function", async t => {
+	// Use Pi's real extension loader, tool merge, and renderer resolution, so the
+	// registration order in the assertion is Pi's, not a mock's.
+	const piRoot = realpathSync(installedPackage);
+	const { loadExtensionFromFactory, createExtensionRuntime } = await import(new URL("./dist/core/extensions/loader.js", pathToFileURL(piRoot)));
+	const { ExtensionRunner } = await import(new URL("./dist/core/extensions/runner.js", pathToFileURL(piRoot)));
+	const { withBuiltInRenderers } = await import(new URL("./dist/core/tools/renderers/index.js", pathToFileURL(piRoot)));
+	// Pi's built-in renderers style through its global theme, which starts uninitialized.
+	(await import(new URL("./dist/modes/interactive/theme/theme.js", pathToFileURL(piRoot)))).initTheme("system");
+	const remoteExecutions = [];
+	const remoteExecute = async () => { remoteExecutions.push("ran"); return { output: "remote" };
+	};
+	const remoteFactory = pi => {
+		pi.registerTool({
+			name: "bash",
+			description: "runs on a remote machine",
+			parameters: { type: "object", properties: { command: { type: "string" } } },
+			execute: remoteExecute,
+		});
+	};
+	const { default: applePiFactory } = loadExtension();
+	for (const [first, second, label] of [[remoteFactory, applePiFactory, "remote first"], [applePiFactory, remoteFactory, "apple-pi first"]]) {
+		const extensions = [];
+		for (const factory of [first, second]) {
+			extensions.push(await loadExtensionFromFactory(factory, "/mock", undefined, createExtensionRuntime()));
+		}
+		const applePi = extensions.find(ext => ext.tools.size === 0);
+		const remote = extensions.find(ext => ext.tools.size > 0);
+		t.assert.ok(applePi && remote, label);
+		assert.equal(applePi.tools.size, 0, `${label}: apple-pi registers no tools`);
+		// Pi keeps the first registration of a name; apple-pi must not take part.
+		const merged = ExtensionRunner.prototype.getAllRegisteredTools.call({ extensions });
+		const bash = merged.find(tool => tool.definition.name === "bash");
+		assert.equal(bash?.definition.execute, remoteExecute, `${label}: the remote execute function stays selected`);
+		// Decoration is display-only: the title renders above the call body.
+		const resolved = ExtensionRunner.prototype.resolveToolRenderers.call({ extensions }, "bash", () => withBuiltInRenderers("bash", remote.tools.get("bash").definition));
+		const lines = resolved.renderCall({ command: "echo hi" }, plainTheme, renderContext()).render(80).map(line => tui.stripTerminalSequences(line).trim());
+		assert.ok(lines.some(line => line.startsWith("→ using bash")), `${label}: title shows`);
+		assert.ok(lines.some(line => line.includes("echo hi")), `${label}: the call body still renders`);
+	}
+	assert.deepEqual(remoteExecutions, [], "No shell command is executed");
 });
 
 test("tokens and cost follow each turn without waiting for the run to settle", async () => {
@@ -443,7 +520,7 @@ test("tokens and cost follow each turn without waiting for the run to settle", a
 
 test("usage refreshes on sent messages and during a run, at most once a minute", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { events, ctx, requests } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { events, ctx, requests } = await createFooter("zai", plainTheme, 200, { clock });
 	const settle = () => new Promise(resolve => setImmediate(resolve));
 	assert.equal(requests.length, 1);
 	for (let i = 0; i < 5; i++) {
@@ -475,7 +552,7 @@ async function streamReply(events, ctx, clock, { waitMs = 0, streamMs, chars = 2
 
 test("output speed: timed from the first delta, shown after the model", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	assert.ok(!plainText(footer).includes("tok/s"));
 	await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 2000, usage: { output: 600 } });
 	assert.ok(plainText(footer).includes("test · ~300 tok/s"));
@@ -483,7 +560,7 @@ test("output speed: timed from the first delta, shown after the model", async ()
 
 test("output speed: short, failed, and aborted replies keep the last good value", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	await streamReply(events, ctx, clock, { streamMs: 100, usage: { output: 600 } });
 	await streamReply(events, ctx, clock, { streamMs: 2000, chars: 40, usage: { output: 10 } });
@@ -494,7 +571,7 @@ test("output speed: short, failed, and aborted replies keep the last good value"
 
 test("output speed: Codex summaries count only received text, not hidden reasoning", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, { clock });
 	for (const delta of ["text_delta", "thinking_delta", "toolcall_delta"]) {
 		await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 1000, chars: 400, usage: { output: 5000, reasoning: 4900 }, delta });
 		assert.ok(plainText(footer).includes("~100 tok/s"));
@@ -506,7 +583,7 @@ test("output speed: Codex summaries count only received text, not hidden reasoni
 
 test("output speed: the last 10 replies are averaged by tokens over time", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	for (let i = 0; i < 10; i++) await streamReply(events, ctx, clock, { streamMs: 2000, chars: 800, usage: { output: 200 } });
 	assert.ok(plainText(footer).includes("100 tok/s"));
 	// (9 × 200 + 600) tokens over 20 s.
@@ -518,7 +595,7 @@ test("output speed: the last 10 replies are averaged by tokens over time", async
 
 test("output speed: empty and non-output events do not start timing or double-count text", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, { clock });
 	const message = { role: "assistant", stopReason: "stop" };
 	const update = event => events.get("message_update")({ message, assistantMessageEvent: event }, ctx);
 	await events.get("message_start")({ message }, ctx);
@@ -538,7 +615,7 @@ test("output speed: empty and non-output events do not start timing or double-co
 
 test("output speed: a model switch clears the old model's speed", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	await events.get("model_select")({}, ctx);
 	assert.ok(!plainText(footer).includes("tok/s"));
@@ -720,7 +797,7 @@ test("chat copy: Pi's real selection-copy action displays success only when the 
 
 test("chat copy: session startup installs the local-clipboard route on the live chat selection hook", async () => {
 	const { copyTui, nativeCopies, terminalWrites } = copyFixture();
-	const run = await createFooter("anthropic", plainTheme, 200, true, { mode: "tui", copyTui, env: { HERDR_ENV: "1" } });
+	const run = await createFooter("anthropic", plainTheme, 200, { mode: "tui", copyTui, env: { HERDR_ENV: "1" } });
 	try {
 		assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee"), true);
 		assert.deepEqual(terminalWrites, [clipboardSequence("aaaa bbbb cccc dddd eeee")]);
@@ -825,7 +902,7 @@ test("copy cleanup: Pi's real forwarding TUI reference restores native copying",
 
 test("copy cleanup: shutdown restores native copying, and a reload with apple-pi reinstalls one patch", async () => {
 	const { copyTui, nativeCopies } = copyFixture();
-	const run = await createFooter("anthropic", plainTheme, 200, true, { mode: "tui", copyTui, env: {} });
+	const run = await createFooter("anthropic", plainTheme, 200, { mode: "tui", copyTui, env: {} });
 	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
 	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Installed at session start");
 	await run.events.get("session_shutdown")({}, run.ctx);
@@ -1077,7 +1154,7 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 		},
 		clearTimeout: timer => timers.delete(timer),
 	};
-	const run = await createFooter("openai-codex", plainTheme, 200, true, { mode: "rpc", clock });
+	const run = await createFooter("openai-codex", plainTheme, 200, { mode: "rpc", clock });
 	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
 	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: quotaError } }, run.ctx);
 	await run.events.get("agent_settled")({}, run.ctx);
@@ -1095,7 +1172,7 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 
 test("auto-resume: a footer refresh still running at settlement is followed by a fresh fetch", async t => {
 	const clock = { t: now, now: () => clock.t, setTimeout: () => ({ unref() {} }), clearTimeout() {} };
-	const run = await createFooter("openai-codex", plainTheme, 200, true, { mode: "rpc", clock });
+	const run = await createFooter("openai-codex", plainTheme, 200, { mode: "rpc", clock });
 	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
 	// More than a minute after the session-start fetch, so the turn starts a footer refresh.
 	clock.t += 61_000;

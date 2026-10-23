@@ -12,8 +12,9 @@
  *    extension statuses) in plain language, plus the model's average output
  *    speed over the last 10 replies.
  * 3. A small "→ using <tool> — <path>" title above each tool block when a path
- *    is available. The built-in call and result rendering stay in place, so
- *    expand/collapse is untouched.
+ *    is available. A renderer resolver adds it, so the registered tool (and
+ *    its execute function) stays Pi's or another extension's; the call body,
+ *    result, and expand/collapse rendering stay in place.
  * 4. A small italic title above assistant text ("✦ reply") and thinking
  *    ("… thinking") blocks. Display-only; user messages stay untouched.
  * 5. A right-aligned previous-user-message button above the fullscreen editor.
@@ -39,19 +40,7 @@
  *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (OAuth from /login)
  */
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import {
-	createBashToolDefinition,
-	createEditToolDefinition,
-	createFindToolDefinition,
-	createGrepToolDefinition,
-	createLsToolDefinition,
-	createPowerShellToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
-	getAgentDir,
-	SettingsManager,
-	UserMessageComponent,
-} from "@earendil-works/pi-coding-agent";
+import { getAgentDir, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { join, sep } from "node:path";
@@ -91,8 +80,6 @@ export function formatReset(row: Row, now = Date.now()): string {
 // `stale` marks rows kept from an earlier fetch after a refresh failed.
 type ProviderStatus = { plan?: string; rows: Row[]; note?: string; stale?: string };
 type WarningCategory = "snapshot" | "footer" | "tool-render" | "registration";
-type BuiltinToolDefinition = ToolDefinition<any, any, any>;
-type BuiltinToolFactory = (cwd: string, options?: any) => BuiltinToolDefinition;
 type ToolCallRenderer = NonNullable<ToolDefinition["renderCall"]>;
 type ToolCallArgs = Parameters<ToolCallRenderer>[0];
 type ToolCallContext = Parameters<ToolCallRenderer>[2];
@@ -1444,70 +1431,43 @@ export default function (pi: ExtensionAPI) {
 			: "";
 	}
 
-	// A registered tool replaces Pi's own, so it must be built the way Pi builds
-	// it: with the user's settings. Without them, shellCommandPrefix, shellPath,
-	// and image auto-resize would silently stop applying. Project settings count
-	// only when Pi trusts the project: shellCommandPrefix runs before every
-	// command, so an untrusted repository must not be able to set it.
-	function builtinToolOptions(ctx: ExtensionContext): { read?: object; bash?: object } {
-		try {
-			const projectTrusted = ctx.isProjectTrusted?.() === true;
-			const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted });
-			return {
-				read: { autoResizeImages: settings.getImageAutoResize() },
-				bash: { commandPrefix: settings.getShellCommandPrefix(), shellPath: settings.getShellPath() },
-			};
-		} catch {
-			// A locked or unreadable settings file: the tools still work, without them.
-			reportWarning("registration");
-			return {};
-		}
-	}
+	// A renderer resolver, not a tool registration: whichever tool Pi has
+	// registered for the name (its own, an SSH wrapper's, a sandbox's) keeps its
+	// execute function, schema, and activation, because Pi lets the first
+	// registration of a name win. Only the call renderer gains the title line;
+	// the call body, result, and shell rendering below it stay exactly as they
+	// were, so expand/collapse keeps working as before.
+	const DECORATED_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
 
-	function installToolHeaders(ctx: ExtensionContext): void {
-		// Built-in tools use different TypeBox schemas, so this table keeps one
-		// permissive boundary while the renderer callback uses public ToolDefinition types.
-		const factories: Array<[string, BuiltinToolFactory]> = [
-			["read", createReadToolDefinition],
-			["bash", createBashToolDefinition],
-			["edit", createEditToolDefinition],
-			["write", createWriteToolDefinition],
-			["grep", createGrepToolDefinition],
-			["find", createFindToolDefinition],
-			["ls", createLsToolDefinition],
-			["powershell", createPowerShellToolDefinition],
-		];
-		const options = builtinToolOptions(ctx);
-		for (const [name, factory] of factories) {
-			try {
-				const builtin = factory(ctx.cwd, (options as Record<string, object | undefined>)[name]);
-				pi.registerTool({
-					...builtin,
-					renderCall(args: ToolCallArgs, theme: Theme, context: ToolCallContext) {
-						const container = new Container();
-						const target = safeToolTarget(args);
-						container.addChild(new Text(themeText(theme).fg("dim", `→ using ${name}${target ? ` — ${target}` : ""}`), 0, 0));
-						try {
-							// Pi remembers our wrapper, but the built-in renderer must receive
-							// its own previous component (Text, Box, etc.), not that wrapper.
-							const previous = context?.lastComponent;
-							const inner = builtin.renderCall?.(args, theme, {
-								...context,
-								lastComponent: previous instanceof Container ? previous.children[1] : undefined,
-							});
-							if (inner) container.addChild(inner);
-						} catch {
-							reportWarning("tool-render");
-							// Built-in call rendering failed — the header alone still shows.
-						}
-						return container;
-					},
-				});
-			} catch {
-				reportWarning("registration");
-				// Tool unavailable in this environment — skip it.
-			}
-		}
+	function installToolHeaders(pi: ExtensionAPI): void {
+		pi.registerToolRenderer((name, next) => {
+			const renderers = next();
+			const baseRenderCall = renderers?.renderCall;
+			// Undecorated tools, and tools with no call renderer, pass through as-is.
+			if (!DECORATED_TOOLS.has(name) || !baseRenderCall) return renderers;
+			return {
+				...renderers,
+				renderCall(args: ToolCallArgs, theme: Theme, context: ToolCallContext) {
+					const container = new Container();
+					const target = safeToolTarget(args);
+					container.addChild(new Text(themeText(theme).fg("dim", `→ using ${name}${target ? ` — ${target}` : ""}`), 0, 0));
+					try {
+						// Pi remembers our wrapper, but the renderer below must receive
+						// its own previous component (Text, Box, etc.), not that wrapper.
+						const previous = context?.lastComponent;
+						const inner = baseRenderCall.call(renderers, args, theme, {
+							...context,
+							lastComponent: previous instanceof Container ? previous.children[1] : undefined,
+						});
+						if (inner) container.addChild(inner);
+					} catch {
+						reportWarning("tool-render");
+						// The renderer below failed — the header alone still shows.
+					}
+					return container;
+				},
+			};
+		});
 	}
 
 	// ---------- assistant block headers ----------
@@ -1525,6 +1485,7 @@ export default function (pi: ExtensionAPI) {
 	// ---------- wiring ----------
 
 	installDestructiveGuard(pi);
+	installToolHeaders(pi);
 	installAutoResume(pi, async ctx => {
 		const key = ctx.model ? PROVIDER_KEYS[ctx.model.provider] : undefined;
 		if (!key) return undefined;
@@ -1551,7 +1512,6 @@ export default function (pi: ExtensionAPI) {
 		updateSnapshot(ctx);
 		clearSpeed();
 		installFooter(ctx);
-		installToolHeaders(ctx);
 		if (ctx.mode === "tui") {
 			// This widget factory is also the only way to receive the live TUI.
 			ctx.ui.setWidget("apple-pi-previous-message", (tui, theme) => {
