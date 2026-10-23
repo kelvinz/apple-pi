@@ -23,8 +23,9 @@
  * 7. Usage-limit errors automatically resume after reset + one minute.
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
- * 8. Shell commands that delete files or discard work ask first. Print and
- *    JSON runs block them. A blocked-state event is sent to Herdr meanwhile.
+ * 8. Shell commands that delete files or discard work ask first, one question
+ *    at a time. Print and JSON runs block them. A blocked-state event is sent
+ *    to Herdr meanwhile.
  *
  * Plan data refreshes when you send a message, after each turn, when the
  * agent settles, when you change model, and on /usage, but not more than
@@ -615,32 +616,119 @@ async function summarizeCommand(command: string, shell: string, ctx: ExtensionCo
 	}
 }
 
+// Nested shell calls can reach the permission handler together (codemode runs
+// tool calls concurrently), and Pi's terminal UI has one editor dialog slot: a
+// second question opened on top of the first replaces it without resolving the
+// first promise, and the run can then wait forever. Flagged questions are
+// therefore asked one at a time; safe commands and headless runs never queue.
+type GuardDecision = { block: true; reason: string } | undefined;
+type GuardJob = {
+	declined: GuardDecision;
+	settle: (value: GuardDecision) => void;
+	fail: (error: unknown) => void;
+	stale: () => boolean;
+	dispose: () => void;
+	run: () => Promise<GuardDecision>;
+};
+
 export function installDestructiveGuard(pi: ExtensionAPI): void {
+	const waiting: GuardJob[] = [];
+	let active: GuardJob | undefined;
+	// Bumped on shutdown: questions queued by an old session must not open in
+	// its replacement, and shutdown cancels whatever is still waiting.
+	let generation = 0;
+
+	function pump(): void {
+		if (active || waiting.length === 0) return;
+		const job = active = waiting.shift()!;
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			if (active === job) active = undefined;
+			job.dispose();
+			// Start the next question only after this one fully settles, so a
+			// rejection here can never poison the rest of the queue.
+			pump();
+		};
+		job.run().then(job.settle, job.fail).then(release, release);
+	}
+
+	pi.on("session_shutdown", () => {
+		generation++;
+		for (const job of waiting.splice(0)) {
+			job.dispose();
+			job.settle(job.declined);
+		}
+		// A dialog on a UI that is gone may never settle; block its command and
+		// free the queue for the session that takes over.
+		if (active) {
+			active.settle(active.declined);
+			active = undefined;
+		}
+		pi.events.emit("herdr:blocked", { active: false });
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (!SHELL_TOOLS.has(event.toolName)) return undefined;
 		const command = String((event.input as { command?: unknown }).command ?? "");
 		const reason = destructiveReason(command);
 		if (!reason) return undefined;
-		const declined = { block: true, reason: `Command stopped. ${reason} Permission was not given. Do not try another way to run it. Ask the user first.` };
+		const declined = { block: true as const, reason: `Command stopped. ${reason} Permission was not given. Do not try another way to run it. Ask the user first.` };
 		// Print and JSON runs have nobody to ask.
 		if (!ctx.hasUI) return declined;
-		// Tell Herdr that a permission question is waiting.
-		pi.events.emit("herdr:blocked", { active: true, label: "permission: Allow this command?" });
-		try {
-			const summary = await summarizeCommand(command, event.toolName, ctx);
-			if (ctx.signal?.aborted) return declined;
-			const message = `Allow this command?\n\n${summary}\n\nCommand:\n${command}`;
-			const choice = await ctx.ui.select(message, ["Yes", "No", "Type a reply"], { signal: ctx.signal });
-			if (ctx.signal?.aborted) return declined;
-			if (choice === "Yes") return undefined;
-			if (choice === "Type a reply") {
-				const reply = await ctx.ui.input("What should the agent do instead?", undefined, { signal: ctx.signal });
-				if (reply?.trim()) return { block: true, reason: `${declined.reason}\n\nUser reply:\n${reply.trim()}` };
-			}
-			return declined;
-		} finally {
-			pi.events.emit("herdr:blocked", { active: false });
-		}
+		// This run's signal, read once: the live ctx can point at a newer run by
+		// the time a queued question finally opens.
+		const signal = ctx.signal;
+		// A run cancelled before it arrives blocks immediately, without waiting
+		// behind the question that is already open.
+		if (signal?.aborted) return declined;
+		const token = generation;
+		return await new Promise<GuardDecision>((resolve, reject) => {
+			let settled = false;
+			const settle = (value: GuardDecision) => { if (!settled) { settled = true; resolve(value); } };
+			const fail = (error: unknown) => { if (!settled) { settled = true; reject(error); } };
+			const job: GuardJob = {
+				declined, settle, fail,
+				stale: () => token !== generation || signal?.aborted === true,
+				dispose: () => signal?.removeEventListener("abort", onAbort),
+				run: async () => {
+					// A question can go stale while queued: cancelled, or its session
+					// shut down. Block it without opening anything.
+					if (job.stale()) return declined;
+					// Tell Herdr that a permission question is waiting.
+					pi.events.emit("herdr:blocked", { active: true, label: "permission: Allow this command?" });
+					try {
+						const summary = await summarizeCommand(command, event.toolName, ctx);
+						if (job.stale()) return declined;
+						const message = `Allow this command?\n\n${summary}\n\nCommand:\n${command}`;
+						const choice = await ctx.ui.select(message, ["Yes", "No", "Type a reply"], { signal });
+						if (job.stale()) return declined;
+						if (choice === "Yes") return undefined;
+						if (choice === "Type a reply") {
+							const reply = await ctx.ui.input("What should the agent do instead?", undefined, { signal });
+							if (reply?.trim()) return { block: true, reason: `${declined.reason}\n\nUser reply:\n${reply.trim()}` };
+						}
+						return declined;
+					} finally {
+						pi.events.emit("herdr:blocked", { active: false });
+					}
+				},
+			};
+			// An abort while still waiting settles immediately, without a question.
+			// It must not clear the Herdr signal of the question that is open.
+			const onAbort = () => {
+				const position = waiting.indexOf(job);
+				if (position >= 0) {
+					waiting.splice(position, 1);
+					job.dispose();
+					settle(declined);
+				}
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			waiting.push(job);
+			pump();
+		});
 	});
 }
 

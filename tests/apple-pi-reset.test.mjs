@@ -176,6 +176,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 		registerTool: tool => tools.push(tool),
 		registerCommand: (name, command) => commands.set(name, command),
 		registerMarkdownTransformer() {},
+		events: { emit() {} },
 		sendUserMessage: text => prompts.push(text),
 		sendMessage: message => entries.push({ type: "custom_message", ...asPlain(message) }),
 	});
@@ -953,16 +954,45 @@ test("guard: ordinary commands, read-only git, and words inside arguments run un
 	]) assert.equal(destructiveReason(command), undefined, command);
 });
 
-function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false } = {}) {
+function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false } = {}) {
 	const extension = loadExtension({}, { status: 200 }, clock);
 	const handlers = new Map();
 	const signals = [];
 	const asked = [];
 	const summaries = [];
+	// Deferred dialogs: one entry per opened select/input, closed by hand or by abort.
+	const dialogs = [];
+	const dialogEvents = [];
+	let openDialogs = 0;
+	let maxOpenDialogs = 0;
 	const pi = { on: (event, handler) => handlers.set(event, handler), events: { emit: (channel, data) => signals.push([channel, data]) } };
 	extension.installDestructiveGuard(pi);
-	const ctx = {
-		hasUI, model, signal,
+	const deferredDialog = (kind, title, opts) => {
+		const dialog = { kind, title, closed: false };
+		let close;
+		const promise = new Promise((resolve, reject) => {
+			close = { resolve, reject };
+		});
+		const finish = settle => {
+			if (dialog.closed) return;
+			dialog.closed = true;
+			openDialogs--;
+			dialogEvents.push({ type: "close", kind });
+			settle();
+		};
+		dialog.answer = value => finish(() => close.resolve(value));
+		dialog.fail = error => finish(() => close.reject(error));
+		// Real Pi selectors resolve undefined when their signal aborts.
+		dialog.aborts = () => finish(() => close.resolve(undefined));
+		opts?.signal?.addEventListener("abort", () => dialog.aborts(), { once: true });
+		dialogs.push(dialog);
+		openDialogs++;
+		maxOpenDialogs = Math.max(maxOpenDialogs, openDialogs);
+		dialogEvents.push({ type: "open", kind });
+		return promise;
+	};
+	const ctxFor = callSignal => ({
+		hasUI, model, signal: callSignal ?? signal,
 		modelRegistry: {
 			streamSimple: (selected, context, options) => {
 				summaries.push({ selected, context, options });
@@ -974,23 +1004,26 @@ function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputErro
 			},
 		},
 		ui: {
-			input: async (title) => {
+			input: async (title, placeholder, opts) => {
+				if (defer) return deferredDialog("input", title, opts);
 				assert.equal(title, "What should the agent do instead?");
 				assert.equal(signals.at(-1)[1].active, true);
 				if (inputError) throw inputError;
 				return reply;
 			},
-			select: async (title, options) => {
+			select: async (title, options, opts) => {
 				asked.push([title, options]);
+				if (defer) return deferredDialog("select", title, opts);
 				// The blocked signal is active while the question is open.
 				assert.deepEqual(asPlain(signals.at(-1)), ["herdr:blocked", { active: true, label: "permission: Allow this command?" }]);
 				if (confirmError) throw confirmError;
 				return answer === null ? undefined : answer;
 			},
 		},
-	};
-	const call = (toolName, input) => handlers.get("tool_call")({ toolName, input }, ctx);
-	return { call, signals, asked, summaries };
+	});
+	const ctx = ctxFor();
+	const call = (toolName, input, callSignal) => handlers.get("tool_call")({ toolName, input }, callSignal ? ctxFor(callSignal) : ctx);
+	return { call, signals, asked, summaries, dialogs, dialogEvents, shutdown: () => handlers.get("session_shutdown")({}, ctxFor()), maxOpen: () => maxOpenDialogs, openCount: () => openDialogs, current: () => dialogs.findLast(dialog => !dialog.closed) };
 }
 
 test("guard: an allowed command runs and clears the blocked signal", async () => {
@@ -1107,4 +1140,164 @@ test("guard: print and JSON runs block without asking; safe and non-shell calls 
 	assert.equal(run.summaries.length, 0);
 	assert.equal((await run.call("powershell", { command: "Remove-Item x" })), undefined);
 	assert.equal(run.asked.length, 1);
+});
+
+// The queue tests drive deferred dialogs by hand, the way codemode's concurrent
+// nested calls arrive: several flagged commands enter the handler together.
+// `current()` is the one open dialog; `settle()` lets the queue advance.
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+test("guard queue: two concurrent commands ask one at a time and both settle", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm -rf dist" });
+	const second = run.call("bash", { command: "rm -rf build" });
+	await settle();
+	assert.equal(run.dialogs.length, 1, "Only the first command opens a question");
+	assert.ok(run.dialogs[0].title.includes("rm -rf dist"));
+	run.dialogs[0].answer("Yes");
+	assert.equal(await first, undefined, "The first command is allowed");
+	await settle();
+	assert.equal(run.dialogs.length, 2, "The second question opens only after the first settles");
+	assert.ok(run.current().title.includes("rm -rf build"));
+	run.current().answer("No");
+	assert.equal((await second).block, true, "The second command is declined after its own question");
+	assert.equal(run.maxOpen(), 1, "At most one dialog is ever open");
+	assert.deepEqual(run.dialogEvents, [
+		{ type: "open", kind: "select" }, { type: "close", kind: "select" },
+		{ type: "open", kind: "select" }, { type: "close", kind: "select" },
+	]);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard queue: three commands survive a failed question in the middle", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
+	const third = run.call("bash", { command: "rm c" });
+	await settle();
+	run.current().answer("Yes");
+	assert.equal(await first, undefined);
+	await settle();
+	run.current().fail(new Error("dialog closed"));
+	await assert.rejects(second, /dialog closed/);
+	await settle();
+	assert.ok(run.current().title.includes("rm c"), "The queue keeps going after a failed question");
+	run.current().answer("Yes");
+	assert.equal(await third, undefined);
+	assert.equal(run.maxOpen(), 1);
+});
+
+test("guard queue: cancelling while waiting blocks the command without opening a question", async () => {
+	const run = guardRun({ defer: true });
+	const firstController = new AbortController();
+	const secondController = new AbortController();
+	const first = run.call("bash", { command: "rm a" }, firstController.signal);
+	const second = run.call("bash", { command: "rm b" }, secondController.signal);
+	await settle();
+	assert.equal(run.dialogs.length, 1);
+	// The queued call is cancelled while the first question is still open.
+	secondController.abort();
+	assert.equal((await second).block, true, "The queued call settles blocked, before the open question does");
+	assert.equal(run.dialogs.length, 1, "No question opened for the cancelled call");
+	assert.equal(run.maxOpen(), 1);
+	// The cancelled call must not clear the first question's Herdr status.
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: true, label: "permission: Allow this command?" }]);
+	// A run that arrives already cancelled never queues either.
+	const lateController = new AbortController();
+	lateController.abort();
+	assert.equal((await run.call("bash", { command: "rm b" }, lateController.signal)).block, true);
+	run.current().answer("No");
+	assert.equal((await first).block, true);
+	assert.equal(run.dialogs.length, 1, "Still only one question was ever opened");
+});
+
+test("guard queue: cancelling during a dialog blocks that command", async () => {
+	const run = guardRun({ defer: true });
+	const controller = new AbortController();
+	const call = run.call("bash", { command: "rm a" }, controller.signal);
+	await settle();
+	controller.abort(); // The open dialog resolves undefined, as Pi's selectors do.
+	assert.equal((await call).block, true, "A cancelled question never allows the command");
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+	assert.equal(run.dialogs.length, 1);
+});
+
+test("guard queue: a typed reply holds the queue until it is submitted", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
+	await settle();
+	run.current().answer("Type a reply");
+	await settle();
+	assert.equal(run.current().kind, "input", "The reply dialog opens");
+	assert.equal(run.maxOpen(), 1, "The reply dialog replaces the question, still one at a time");
+	// The second command cannot open its question while the reply is pending.
+	await settle();
+	assert.equal(run.dialogs.length, 2);
+	run.current().answer("Keep a. Delete only b.");
+	const result = await first;
+	assert.equal(result.block, true);
+	assert.match(result.reason, /User reply:\nKeep a\. Delete only b\./);
+	await settle();
+	assert.ok(run.current().title.includes("rm b"), "The second question opens after the reply");
+	run.current().answer("No");
+	assert.equal((await second).block, true);
+	assert.equal(run.maxOpen(), 1);
+});
+
+test("guard queue: shutdown blocks waiting calls, frees the queue, and blocks stale ones", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
+	await settle();
+	run.shutdown();
+	// Every in-flight interaction settles blocked; none of them runs a command.
+	assert.equal((await first).block, true);
+	assert.equal((await second).block, true);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+	assert.equal(run.dialogs.length, 1, "The queued question never opened");
+	// The shut-down session's dialog resolves the way a destroyed UI does.
+	run.dialogs[0].aborts();
+	// The replacement session can ask again; an old queued request cannot.
+	const third = run.call("bash", { command: "rm c" });
+	await settle();
+	assert.ok(run.current().title.includes("rm c"), "The replacement session's question opens");
+	run.current().answer("No");
+	assert.equal((await third).block, true);
+	assert.equal(run.maxOpen(), 1);
+});
+
+test("guard queue: Pi's real extension selector resolves only one dialog at a time", async t => {
+	// Documents why the queue exists: InteractiveMode has a single editor slot,
+	// so a second selector opened on top of the first displaces it without
+	// resolving its promise. Uses Pi's real selector with a fake editor; no real
+	// session is started and no command runs.
+	const piRoot = realpathSync(installedPackage);
+	const { initTheme } = await import(new URL("./dist/modes/interactive/theme/theme.js", pathToFileURL(piRoot)));
+	initTheme("system");
+	const { InteractiveMode } = await import(new URL("./dist/modes/interactive/interactive-mode.js", pathToFileURL(piRoot)));
+	const blocked = [];
+	const added = [];
+	const mode = {
+		extensionSelector: undefined,
+		activeSelectorDispose: undefined,
+		activeSelectorToken: undefined,
+		disposeActiveSelector: InteractiveMode.prototype.disposeActiveSelector,
+		editorContainer: { clear() { added.length = 0; }, addChild(component) { added.push(component); } },
+		ui: { setFocus() {}, requestRender() {} },
+		programStatus: { setBlocked: (key, value) => blocked.push([key, value]) },
+	};
+	const select = InteractiveMode.prototype.showExtensionSelector.bind(mode);
+	const first = select("Allow this command?\n\nfirst", ["Yes", "No"]);
+	await settle();
+	t.assert.equal(added.length, 1);
+	const second = select("Allow this command?\n\nsecond", ["Yes", "No"]);
+	await settle();
+	// The displaced selector's promise never settles: this is the hang the queue
+	// prevents by never opening a second question.
+	let firstSettled = false;
+	void first.then(() => { firstSettled = true; });
+	await settle();
+	t.assert.equal(firstSettled, false);
+	t.assert.equal(blocked.at(-1)[1].message, "Allow this command?\n\nsecond");
 });
