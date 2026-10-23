@@ -29,32 +29,15 @@ const resetAt = new Date(2030, 9, 6, 18, 30).getTime();
 const now = resetAt - (3 * 3600 + 42 * 60) * 1000;
 const hour = 3600;
 const day = 24 * hour;
-// Set to make the mocked SettingsManager fail, as a locked settings file would.
-const settingsFailure = { on: false };
 
 // `state.status` is the HTTP status every mocked request returns; tests change it mid-run.
 function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env = {}) {
 	const exports = {};
 	const requests = [];
-	const toolCalls = {};
-	const settingsCalls = [];
+	const sentHeaders = [];
 	const piModule = {
 		getAgentDir: () => "/mock-agent",
 		UserMessageComponent: class {},
-		SettingsManager: {
-			create: (cwd, agentDir, options) => {
-				settingsCalls.push({ cwd, agentDir, options });
-				if (settingsFailure.on) throw new Error("ELOCKED");
-				return { getImageAutoResize: () => false, getShellCommandPrefix: () => "set -e", getShellPath: () => "/bin/zsh" };
-			},
-		},
-		...Object.fromEntries(["Bash", "Edit", "Find", "Grep", "Ls", "PowerShell", "Read", "Write"].map(name => [
-			`create${name}ToolDefinition`,
-			(cwd, options) => {
-				toolCalls[name.toLowerCase()] = { cwd, options };
-				return { renderCall() {} };
-			},
-		])),
 	};
 	runInNewContext(compiled, {
 		exports,
@@ -64,7 +47,9 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 			if (name === "@earendil-works/pi-tui") return tui;
 			if (name === "node:fs") return {
 				readFileSync: () => JSON.stringify({
-					zai: { type: "api_key", key: "test" },
+					// A saved reference, as Pi stores for env-var/credential-command
+					// keys: this raw text must never reach a provider.
+					zai: { type: "api_key", key: "${ZAI_API_KEY}" },
 					"openai-codex": { type: "oauth", access: "test", accountId: "test" },
 				}),
 			};
@@ -78,13 +63,14 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 		process: { env },
 		fetch: async (url, options) => {
 			requests.push(url);
+			sentHeaders.push({ url, headers: options?.headers });
 			assert.ok(Object.hasOwn(responses, url), `Unexpected HTTP request: ${url}`);
 			await state.beforeResponse?.(options);
 			return { ok: state.status >= 200 && state.status < 300, status: state.status, json: async () => responses[url] };
 		},
 	});
 	assert.equal(exports.__JITI_ERROR__, undefined, "The extension must compile");
-	return { ...exports, requests, toolCalls, settingsCalls };
+	return { ...exports, requests, sentHeaders };
 }
 
 const { formatReset, reflowText } = loadExtension();
@@ -153,14 +139,15 @@ const fixtures = {
 	},
 };
 
-async function createFooter(provider, theme, status = 200, projectTrusted = true, options = {}) {
+async function createFooter(provider, theme, status = 200, options = {}) {
 	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
 	const state = { status };
-	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state, options.clock, options.env);
+	const extension = loadExtension({ ...(fixture ? { [fixture.url]: fixture.response } : {}), ...options.responses }, state, options.clock, options.env);
 	const events = new Map();
 	const commands = new Map();
 	const tools = [];
+	const toolRenderers = [];
 	const prompts = [];
 	const entries = [];
 	const statuses = new Map();
@@ -174,15 +161,28 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 			} : handler);
 		},
 		registerTool: tool => tools.push(tool),
+		registerToolRenderer: resolver => toolRenderers.push(resolver),
 		registerCommand: (name, command) => commands.set(name, command),
 		registerMarkdownTransformer() {},
+		events: { emit() {} },
 		sendUserMessage: text => prompts.push(text),
 		sendMessage: message => entries.push({ type: "custom_message", ...asPlain(message) }),
 	});
 	const notices = [];
+	const apiKeyCalls = [];
 	const ctx = {
-		mode: options.mode ?? "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted, isIdle: () => true,
+		mode: options.mode ?? "print", cwd: "/mock", hasUI: true, isIdle: () => true,
 		model: { id: "test", provider },
+		modelRegistry: {
+			getApiKeyForProvider: async requested => {
+				apiKeyCalls.push(requested);
+				if (options.zaiApiKey instanceof Error) throw options.zaiApiKey;
+				if (requested !== "zai") return undefined;
+				// null means Pi has no credential for zai.
+				if (options.zaiApiKey === null) return undefined;
+				return options.zaiApiKey ?? "test";
+			},
+		},
 		sessionManager: { getEntries: () => entries, getCwd: () => "/mock", getSessionId: () => "footer-thread" },
 		ui: {
 			setWidget(_key, factory) {
@@ -201,8 +201,8 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	};
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
-	assert.equal(extension.requests.length, fixture ? 1 : 0);
-	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, prompts, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
+	assert.equal(extension.requests.length, options.expectRequests ?? (fixture ? 1 : 0));
+	return { footer, fixture, events, commands, ctx, entries, state, tools, toolRenderers, notices, prompts, requests: extension.requests, sentHeaders: extension.sentHeaders, apiKeyCalls };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
@@ -259,7 +259,7 @@ test("Codex: a ten-second timeout keeps cached usage and a successful retry clea
 		signal = new AbortController();
 		return signal.signal;
 	} } };
-	const { footer, commands, ctx, state } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const { footer, commands, ctx, state } = await createFooter("openai-codex", plainTheme, 200, { clock });
 	assert.ok(plainText(footer).includes("75% left"));
 	state.beforeResponse = ({ signal }) => new Promise((resolve, reject) => {
 		signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -297,6 +297,88 @@ test("zai: a failed refresh keeps the last good rows and says they are old", asy
 	assert.ok(!plainText(footer).includes("showing last result"), "A good refresh clears the note");
 });
 
+// Z.ai credentials come from Pi's resolver, so saved references work and the
+// stored reference text itself is never sent to the provider.
+test("zai auth: a resolved literal key is sent as the bearer token", async () => {
+	const run = await createFooter("zai", plainTheme, 200, { zaiApiKey: "resolved-literal-key" });
+	assert.ok(plainText(run.footer).includes("100% left"));
+	assert.deepEqual(run.apiKeyCalls, ["zai"], "The key is asked from Pi's registry, for zai only");
+	assert.equal(run.sentHeaders.length, 1);
+	assert.equal(run.sentHeaders[0].headers.authorization, "Bearer resolved-literal-key");
+	assert.notEqual(run.sentHeaders[0].headers.authorization, "Bearer ${ZAI_API_KEY}");
+});
+
+test("zai auth: environment references and credential commands resolve through Pi", async () => {
+	for (const resolved of ["env-resolved-key", "command-resolved-key"]) {
+		const run = await createFooter("zai", plainTheme, 200, { zaiApiKey: resolved });
+		assert.equal(run.sentHeaders[0].headers.authorization, `Bearer ${resolved}`);
+		// The unresolved reference stored in auth.json is never the token.
+		assert.ok(run.sentHeaders.every(sent => !JSON.stringify(sent.headers).includes("ZAI_API_KEY")));
+	}
+});
+
+test("zai auth: missing credentials mean no request and a not-set-up note", async () => {
+	const run = await createFooter("zai", plainTheme, 200, { zaiApiKey: null, expectRequests: 0 });
+	assert.equal(run.requests.length, 0);
+	assert.deepEqual(run.apiKeyCalls, ["zai"]);
+	assert.ok(plainText(run.footer).includes("zai"), "The provider is still named");
+	assert.ok(plainText(run.footer).includes("not set up"));
+});
+
+test("zai auth: a failing resolver keeps the last good rows as stale", async () => {
+	const options = { zaiApiKey: "good-key" };
+	const run = await createFooter("zai", plainTheme, 200, options);
+	assert.ok(plainText(run.footer).includes("100% left"));
+	options.zaiApiKey = new Error("credential command failed");
+	await run.commands.get("usage").handler("", run.ctx);
+	const text = plainText(run.footer);
+	assert.ok(text.includes("100% left"), "The last good rows stay");
+	assert.ok(text.includes("showing last result · credential command failed"));
+	// A later successful lookup clears the stale note.
+	options.zaiApiKey = "good-key";
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.ok(!plainText(run.footer).includes("showing last result"));
+});
+
+test("zai auth: a key Pi stops resolving replaces the rows with a not-set-up note", async () => {
+	// Pi 1.3.0's getApiKeyForProvider catches resolution errors and returns
+	// undefined, so a failing credential command arrives here as no key.
+	const options = { zaiApiKey: "good-key" };
+	const run = await createFooter("zai", plainTheme, 200, options);
+	assert.ok(plainText(run.footer).includes("100% left"));
+	options.zaiApiKey = null;
+	await run.commands.get("usage").handler("", run.ctx);
+	const text = plainText(run.footer);
+	assert.ok(text.includes("not set up"));
+	assert.ok(!text.includes("100% left"), "Rows Pi can no longer authenticate are not shown as current");
+	assert.equal(run.requests.length, 1, "No request is sent without a key");
+});
+
+test("zai auth: a provider switch during a pending resolution caches under the requested provider", async () => {
+	let resolveZai;
+	const options = { zaiApiKey: new Promise(resolve => { resolveZai = resolve; }) };
+	const codexFixture = fixtures["openai-codex"];
+	const run = await createFooter("zai", plainTheme, 200, {
+		...options,
+		expectRequests: 0,
+		responses: { [codexFixture.url]: codexFixture.response },
+	});
+	assert.equal(run.requests.length, 0, "The zai request waits for its key");
+	// The model switches to Codex while the zai key is still resolving.
+	run.ctx.model = { id: "test", provider: "openai-codex" };
+	await run.events.get("model_select")({}, run.ctx);
+	assert.ok(plainText(run.footer).includes("75% left"), "Codex data shows while zai is pending");
+	resolveZai("late-zai-key");
+	await new Promise(resolve => setImmediate(resolve));
+	// The late zai response is cached under zai, not under the provider on screen.
+	assert.equal(run.requests.length, 2);
+	assert.equal(run.sentHeaders.find(sent => sent.url.includes("api.z.ai")).headers.authorization, "Bearer late-zai-key");
+	run.ctx.model = { id: "test", provider: "zai" };
+	await run.events.get("model_select")({}, run.ctx);
+	assert.equal(run.requests.length, 2, "Switching back reuses the cached zai rows");
+	assert.ok(plainText(run.footer).includes("100% left"));
+});
+
 test("providers without a usage endpoint make no request", async () => {
 	for (const provider of ["anthropic", "zai-coding-cn"]) {
 		const { footer, requests } = await createFooter(provider, plainTheme);
@@ -305,32 +387,125 @@ test("providers without a usage endpoint make no request", async () => {
 	}
 });
 
-test("built-in tools are re-registered with the user's Pi settings", async () => {
-	const { tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
-	const toolCalls = JSON.parse(JSON.stringify(realmCalls)); // the mock runs in another vm realm
-	assert.equal(tools.length, 8);
-	assert.deepEqual(toolCalls.bash, { cwd: "/mock", options: { commandPrefix: "set -e", shellPath: "/bin/zsh" } });
-	assert.deepEqual(toolCalls.read, { cwd: "/mock", options: { autoResizeImages: false } });
-	assert.deepEqual(toolCalls.edit, { cwd: "/mock" });
+// A plain render context for tool renderers: lastComponent is the slot's previous component.
+function renderContext(overrides = {}) {
+	return { args: {}, toolCallId: "call-1", invalidate() {}, lastComponent: undefined, state: {}, cwd: "/mock", executionStarted: false, ...overrides };
+}
+const headerLine = component => component.render(100).map(line => tui.stripTerminalSequences(line).trim());
+
+test("tool headers: no tools are registered; one resolver decorates only named tools that render calls", async () => {
+	const run = await createFooter("zai", plainTheme);
+	assert.equal(run.tools.length, 0, "registerTool is never called");
+	assert.equal(run.toolRenderers.length, 1, "Exactly one renderer resolver");
+	const resolver = run.toolRenderers[0];
+	const base = { renderCall() {}, renderResult() {}, renderShell() {} };
+	assert.notEqual(resolver("bash", () => base).renderCall, base.renderCall, "bash is decorated");
+	assert.notEqual(resolver("powershell", () => base).renderCall, base.renderCall, "powershell is decorated");
+	assert.equal(resolver("mcp__server__tool", () => base), base, "Other tools pass through as the same object");
+	const noCall = { renderResult: base.renderResult, renderShell: base.renderShell };
+	assert.equal(resolver("bash", () => noCall), noCall, "No call renderer below means no decoration");
+	assert.equal(resolver("bash", () => undefined), undefined, "Tools without renderers stay unknown");
 });
 
-test("project settings reach the built-in tools only when Pi trusts the project", async () => {
-	for (const trusted of [true, false]) {
-		const { settingsCalls } = await createFooter("zai", plainTheme, 200, trusted);
-		assert.deepEqual(JSON.parse(JSON.stringify(settingsCalls)), [{ cwd: "/mock", agentDir: "/mock-agent", options: { projectTrusted: trusted } }]);
-	}
+test("tool headers: the renderer below is called, and result and shell rendering pass through unchanged", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const seen = [];
+	const inner = new tui.Text("$ echo hi", 0, 0);
+	const renderResult = () => "result";
+	const renderShell = () => "shell";
+	const wrapped = resolver("bash", () => ({
+		renderCall(args, theme, context) { seen.push({ args, theme, context }); return inner; },
+		renderResult,
+		renderShell,
+	}));
+	assert.equal(wrapped.renderResult, renderResult, "Result rendering is the same function");
+	assert.equal(wrapped.renderShell, renderShell, "Shell rendering is the same function");
+	const args = { command: "echo hi" };
+	const context = renderContext();
+	const lines = headerLine(wrapped.renderCall(args, plainTheme, context));
+	assert.deepEqual(seen.map(call => call.args), [args], "The renderer below sees the same arguments");
+	assert.equal(seen[0].theme, plainTheme);
+	assert.equal(seen[0].context.lastComponent, undefined, "No previous component stays undefined");
+	assert.deepEqual(lines, ["→ using bash", "$ echo hi"]);
 });
 
-test("a settings read failure warns and still registers the tools without settings", async () => {
-	settingsFailure.on = true;
-	try {
-		const { notices, tools, toolCalls: realmCalls } = await createFooter("zai", plainTheme);
-		assert.deepEqual(notices, [["apple-pi registration unavailable", "warning"]]);
-		assert.equal(tools.length, 8);
-		assert.deepEqual(JSON.parse(JSON.stringify(realmCalls)).bash, { cwd: "/mock" });
-	} finally {
-		settingsFailure.on = false;
+test("tool headers: titles escape control characters in paths", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const wrapped = resolver("read", () => ({ renderCall: () => new tui.Text("body", 0, 0) }));
+	const lines = headerLine(wrapped.renderCall({ path: "a\u001bb\u007fc" }, plainTheme, renderContext()));
+	assert.deepEqual(lines, ["→ using read — a\\u001bb\\u007fc", "body"]);
+});
+
+test("tool headers: the renderer below receives its own previous inner component", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const seen = [];
+	const wrapped = resolver("edit", () => ({ renderCall: (args, theme, context) => { seen.push(context.lastComponent); return new tui.Text("edit", 0, 0); } }));
+	// A previous render's wrapper: header above, the renderer's own component below.
+	const previousInner = new tui.Text("previous inner", 0, 0);
+	const previous = new tui.Container();
+	previous.addChild(new tui.Text("→ using edit", 0, 0));
+	previous.addChild(previousInner);
+	wrapped.renderCall({ file_path: "a.ts" }, plainTheme, renderContext({ lastComponent: previous }));
+	wrapped.renderCall({ file_path: "a.ts" }, plainTheme, renderContext({ lastComponent: previousInner }));
+	assert.deepEqual(seen, [previousInner, undefined], "Only the wrapper's second child is reused; foreign components are not");
+});
+
+test("tool headers: a renderer below that throws keeps the header and warns once", async () => {
+	const run = await createFooter("zai", plainTheme);
+	const resolver = run.toolRenderers[0];
+	const wrapped = resolver("write", () => ({ renderCall() { throw new Error("renderer changed"); } }));
+	for (let i = 0; i < 2; i++) {
+		const lines = headerLine(wrapped.renderCall({ path: "out.txt" }, plainTheme, renderContext()));
+		assert.deepEqual(lines, ["→ using write — out.txt"], "The header alone still shows");
 	}
+	await new Promise(resolve => setImmediate(resolve));
+	assert.deepEqual(run.notices, [["apple-pi tool renderer unavailable", "warning"]]);
+});
+
+test("tool headers: a remote tool loaded before or after apple-pi keeps its execute function", async t => {
+	// Use Pi's real extension loader, tool merge, and renderer resolution, so the
+	// registration order in the assertion is Pi's, not a mock's.
+	const piRoot = realpathSync(installedPackage);
+	const { loadExtensionFromFactory, createExtensionRuntime } = await import(new URL("./dist/core/extensions/loader.js", pathToFileURL(piRoot)));
+	const { ExtensionRunner } = await import(new URL("./dist/core/extensions/runner.js", pathToFileURL(piRoot)));
+	const { withBuiltInRenderers } = await import(new URL("./dist/core/tools/renderers/index.js", pathToFileURL(piRoot)));
+	// Pi's built-in renderers style through its global theme, which starts uninitialized.
+	(await import(new URL("./dist/modes/interactive/theme/theme.js", pathToFileURL(piRoot)))).initTheme("system");
+	const remoteExecutions = [];
+	const remoteExecute = async () => { remoteExecutions.push("ran"); return { output: "remote" };
+	};
+	const remoteFactory = pi => {
+		pi.registerTool({
+			name: "bash",
+			description: "runs on a remote machine",
+			parameters: { type: "object", properties: { command: { type: "string" } } },
+			execute: remoteExecute,
+		});
+	};
+	const { default: applePiFactory } = loadExtension();
+	for (const [first, second, label] of [[remoteFactory, applePiFactory, "remote first"], [applePiFactory, remoteFactory, "apple-pi first"]]) {
+		const extensions = [];
+		for (const factory of [first, second]) {
+			extensions.push(await loadExtensionFromFactory(factory, "/mock", undefined, createExtensionRuntime()));
+		}
+		const applePi = extensions.find(ext => ext.tools.size === 0);
+		const remote = extensions.find(ext => ext.tools.size > 0);
+		t.assert.ok(applePi && remote, label);
+		assert.equal(applePi.tools.size, 0, `${label}: apple-pi registers no tools`);
+		// Pi keeps the first registration of a name; apple-pi must not take part.
+		const merged = ExtensionRunner.prototype.getAllRegisteredTools.call({ extensions });
+		const bash = merged.find(tool => tool.definition.name === "bash");
+		assert.equal(bash?.definition.execute, remoteExecute, `${label}: the remote execute function stays selected`);
+		// Decoration is display-only: the title renders above the call body.
+		const resolved = ExtensionRunner.prototype.resolveToolRenderers.call({ extensions }, "bash", () => withBuiltInRenderers("bash", remote.tools.get("bash").definition));
+		const lines = resolved.renderCall({ command: "echo hi" }, plainTheme, renderContext()).render(80).map(line => tui.stripTerminalSequences(line).trim());
+		assert.ok(lines.some(line => line.startsWith("→ using bash")), `${label}: title shows`);
+		assert.ok(lines.some(line => line.includes("echo hi")), `${label}: the call body still renders`);
+	}
+	assert.deepEqual(remoteExecutions, [], "No shell command is executed");
 });
 
 test("tokens and cost follow each turn without waiting for the run to settle", async () => {
@@ -345,7 +520,7 @@ test("tokens and cost follow each turn without waiting for the run to settle", a
 
 test("usage refreshes on sent messages and during a run, at most once a minute", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { events, ctx, requests } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { events, ctx, requests } = await createFooter("zai", plainTheme, 200, { clock });
 	const settle = () => new Promise(resolve => setImmediate(resolve));
 	assert.equal(requests.length, 1);
 	for (let i = 0; i < 5; i++) {
@@ -377,7 +552,7 @@ async function streamReply(events, ctx, clock, { waitMs = 0, streamMs, chars = 2
 
 test("output speed: timed from the first delta, shown after the model", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	assert.ok(!plainText(footer).includes("tok/s"));
 	await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 2000, usage: { output: 600 } });
 	assert.ok(plainText(footer).includes("test · ~300 tok/s"));
@@ -385,7 +560,7 @@ test("output speed: timed from the first delta, shown after the model", async ()
 
 test("output speed: short, failed, and aborted replies keep the last good value", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	await streamReply(events, ctx, clock, { streamMs: 100, usage: { output: 600 } });
 	await streamReply(events, ctx, clock, { streamMs: 2000, chars: 40, usage: { output: 10 } });
@@ -396,7 +571,7 @@ test("output speed: short, failed, and aborted replies keep the last good value"
 
 test("output speed: Codex summaries count only received text, not hidden reasoning", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, { clock });
 	for (const delta of ["text_delta", "thinking_delta", "toolcall_delta"]) {
 		await streamReply(events, ctx, clock, { waitMs: 5000, streamMs: 1000, chars: 400, usage: { output: 5000, reasoning: 4900 }, delta });
 		assert.ok(plainText(footer).includes("~100 tok/s"));
@@ -408,7 +583,7 @@ test("output speed: Codex summaries count only received text, not hidden reasoni
 
 test("output speed: the last 10 replies are averaged by tokens over time", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	for (let i = 0; i < 10; i++) await streamReply(events, ctx, clock, { streamMs: 2000, chars: 800, usage: { output: 200 } });
 	assert.ok(plainText(footer).includes("100 tok/s"));
 	// (9 × 200 + 600) tokens over 20 s.
@@ -420,7 +595,7 @@ test("output speed: the last 10 replies are averaged by tokens over time", async
 
 test("output speed: empty and non-output events do not start timing or double-count text", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("openai-codex", plainTheme, 200, { clock });
 	const message = { role: "assistant", stopReason: "stop" };
 	const update = event => events.get("message_update")({ message, assistantMessageEvent: event }, ctx);
 	await events.get("message_start")({ message }, ctx);
@@ -440,7 +615,7 @@ test("output speed: empty and non-output events do not start timing or double-co
 
 test("output speed: a model switch clears the old model's speed", async () => {
 	const clock = { t: now, now: () => clock.t };
-	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, true, { clock });
+	const { footer, events, ctx } = await createFooter("zai", plainTheme, 200, { clock });
 	await streamReply(events, ctx, clock, { streamMs: 2000, usage: { output: 600 } });
 	await events.get("model_select")({}, ctx);
 	assert.ok(!plainText(footer).includes("tok/s"));
@@ -622,7 +797,7 @@ test("chat copy: Pi's real selection-copy action displays success only when the 
 
 test("chat copy: session startup installs the local-clipboard route on the live chat selection hook", async () => {
 	const { copyTui, nativeCopies, terminalWrites } = copyFixture();
-	const run = await createFooter("anthropic", plainTheme, 200, true, { mode: "tui", copyTui, env: { HERDR_ENV: "1" } });
+	const run = await createFooter("anthropic", plainTheme, 200, { mode: "tui", copyTui, env: { HERDR_ENV: "1" } });
 	try {
 		assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee"), true);
 		assert.deepEqual(terminalWrites, [clipboardSequence("aaaa bbbb cccc dddd eeee")]);
@@ -630,6 +805,116 @@ test("chat copy: session startup installs the local-clipboard route on the live 
 	} finally {
 		await run.events.get("session_shutdown")({}, run.ctx);
 	}
+});
+
+test("copy cleanup: cleanup restores the native callback exactly once", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Reflowed while installed");
+	cleanup();
+	assert.equal(copyTui.copySelection, native, "The native callback itself is back");
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[1], " aaaa bbbb cccc dddd\n eeee", "Native copying is untouched after cleanup");
+	// Repeated cleanup cannot clobber a patch installed by someone else later.
+	const laterPatch = async text => native(text);
+	copyTui.copySelection = laterPatch;
+	cleanup();
+	assert.equal(copyTui.copySelection, laterPatch, "A later callback by another extension survives");
+});
+
+test("copy cleanup: install, cleanup, and reinstall keep working", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const first = patchCopyReflow(copyTui, () => 1);
+	first();
+	patchCopyReflow(copyTui, () => 1)();
+	assert.equal(copyTui.copySelection, native, "Nothing stays installed after both cleanups");
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "A reinstall after cleanup reflows again");
+	cleanup();
+	assert.equal(copyTui.copySelection, native);
+});
+
+test("copy cleanup: an older patch's cleanup leaves a newer patch installed", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const older = patchCopyReflow(copyTui, () => 1);
+	const newer = patchCopyReflow(copyTui, () => 1);
+	older(); // A reload replaced the older patch; its cleanup must not restore yet.
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "The newer patch still reflows");
+	assert.notEqual(copyTui.copySelection, native);
+	newer();
+	assert.equal(copyTui.copySelection, native, "The newest patch's cleanup restores native copying");
+});
+
+test("copy cleanup: another extension's replacement survives cleanup on a raw TUI", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	const applePiWrapper = copyTui.copySelection;
+	const seenByOther = [];
+	copyTui.copySelection = async text => { seenByOther.push(text); return applePiWrapper(text); };
+	cleanup();
+	assert.notEqual(copyTui.copySelection, native, "The other extension's callback stays installed");
+	assert.equal(await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee"), true);
+	assert.deepEqual(seenByOther, [" aaaa bbbb cccc dddd\n eeee"]);
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Its chain through apple-pi's wrapper still works");
+});
+
+test("copy cleanup: unsupported layouts return a no-op cleanup", () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const copyTui = { terminal: { write() {} } };
+	const cleanup = patchCopyReflow(copyTui, () => 1);
+	assert.equal(copyTui.copySelection, undefined);
+	assert.doesNotThrow(cleanup);
+	assert.equal(copyTui.copySelection, undefined);
+});
+
+test("copy cleanup: Pi's real forwarding TUI reference restores native copying", async () => {
+	const { patchCopyReflow } = loadExtension({}, { status: 200 }, {}, {});
+	const piRoot = realpathSync(installedPackage);
+	const { createInteractiveTuiReference } = await import(new URL("./dist/modes/interactive/tui-renderer.js", pathToFileURL(piRoot)));
+	const { copyTui, nativeCopies } = copyFixture();
+	const native = copyTui.copySelection;
+	// Every function read through this reference yields a fresh closure, so
+	// function identity cannot be compared through it.
+	const reference = createInteractiveTuiReference(() => copyTui);
+	const cleanup = patchCopyReflow(reference, () => 1);
+	assert.notEqual(reference.copySelection, native);
+	await reference.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Reflow works through the reference");
+	cleanup();
+	assert.notEqual(copyTui.copySelection, undefined);
+	// Through the reference the restored callback is a fresh forwarding closure,
+	// so identity cannot be compared; its behavior must be exactly native.
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[1], " aaaa bbbb cccc dddd\n eeee", "Native copying is restored through the reference");
+	assert.equal(nativeCopies.length, 2, "No second reflowing copy happened");
+});
+
+test("copy cleanup: shutdown restores native copying, and a reload with apple-pi reinstalls one patch", async () => {
+	const { copyTui, nativeCopies } = copyFixture();
+	const run = await createFooter("anthropic", plainTheme, 200, { mode: "tui", copyTui, env: {} });
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies, ["aaaa bbbb cccc dddd eeee"], "Installed at session start");
+	await run.events.get("session_shutdown")({}, run.ctx);
+	// Removing apple-pi, then /reload without it: normal copying stays.
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[1], " aaaa bbbb cccc dddd\n eeee", "Shutdown restored native copying");
+	// A reload with apple-pi still installed reinstalls exactly one patch.
+	await run.events.get("session_start")({}, run.ctx);
+	await copyTui.copySelection(" aaaa bbbb cccc dddd\n eeee");
+	assert.deepEqual(nativeCopies[2], "aaaa bbbb cccc dddd eeee", "One fresh patch, not a stack");
+	await run.events.get("session_shutdown")({}, run.ctx);
+	assert.equal(copyTui.copySelection.constructor, copyFixture().copyTui.copySelection.constructor, "Native again after the second shutdown");
 });
 
 const quotaError = "You have hit your ChatGPT usage limit (plus plan). Try again in ~22 min.";
@@ -869,7 +1154,7 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 		},
 		clearTimeout: timer => timers.delete(timer),
 	};
-	const run = await createFooter("openai-codex", plainTheme, 200, true, { mode: "rpc", clock });
+	const run = await createFooter("openai-codex", plainTheme, 200, { mode: "rpc", clock });
 	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
 	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: quotaError } }, run.ctx);
 	await run.events.get("agent_settled")({}, run.ctx);
@@ -887,7 +1172,7 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 
 test("auto-resume: a footer refresh still running at settlement is followed by a fresh fetch", async t => {
 	const clock = { t: now, now: () => clock.t, setTimeout: () => ({ unref() {} }), clearTimeout() {} };
-	const run = await createFooter("openai-codex", plainTheme, 200, true, { mode: "rpc", clock });
+	const run = await createFooter("openai-codex", plainTheme, 200, { mode: "rpc", clock });
 	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
 	// More than a minute after the session-start fetch, so the turn starts a footer refresh.
 	clock.t += 61_000;
@@ -953,16 +1238,45 @@ test("guard: ordinary commands, read-only git, and words inside arguments run un
 	]) assert.equal(destructiveReason(command), undefined, command);
 });
 
-function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false } = {}) {
+function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false } = {}) {
 	const extension = loadExtension({}, { status: 200 }, clock);
 	const handlers = new Map();
 	const signals = [];
 	const asked = [];
 	const summaries = [];
+	// Deferred dialogs: one entry per opened select/input, closed by hand or by abort.
+	const dialogs = [];
+	const dialogEvents = [];
+	let openDialogs = 0;
+	let maxOpenDialogs = 0;
 	const pi = { on: (event, handler) => handlers.set(event, handler), events: { emit: (channel, data) => signals.push([channel, data]) } };
 	extension.installDestructiveGuard(pi);
-	const ctx = {
-		hasUI, model, signal,
+	const deferredDialog = (kind, title, opts) => {
+		const dialog = { kind, title, closed: false };
+		let close;
+		const promise = new Promise((resolve, reject) => {
+			close = { resolve, reject };
+		});
+		const finish = settle => {
+			if (dialog.closed) return;
+			dialog.closed = true;
+			openDialogs--;
+			dialogEvents.push({ type: "close", kind });
+			settle();
+		};
+		dialog.answer = value => finish(() => close.resolve(value));
+		dialog.fail = error => finish(() => close.reject(error));
+		// Real Pi selectors resolve undefined when their signal aborts.
+		dialog.aborts = () => finish(() => close.resolve(undefined));
+		opts?.signal?.addEventListener("abort", () => dialog.aborts(), { once: true });
+		dialogs.push(dialog);
+		openDialogs++;
+		maxOpenDialogs = Math.max(maxOpenDialogs, openDialogs);
+		dialogEvents.push({ type: "open", kind });
+		return promise;
+	};
+	const ctxFor = callSignal => ({
+		hasUI, model, signal: callSignal ?? signal,
 		modelRegistry: {
 			streamSimple: (selected, context, options) => {
 				summaries.push({ selected, context, options });
@@ -974,23 +1288,26 @@ function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputErro
 			},
 		},
 		ui: {
-			input: async (title) => {
+			input: async (title, placeholder, opts) => {
+				if (defer) return deferredDialog("input", title, opts);
 				assert.equal(title, "What should the agent do instead?");
 				assert.equal(signals.at(-1)[1].active, true);
 				if (inputError) throw inputError;
 				return reply;
 			},
-			select: async (title, options) => {
+			select: async (title, options, opts) => {
 				asked.push([title, options]);
+				if (defer) return deferredDialog("select", title, opts);
 				// The blocked signal is active while the question is open.
 				assert.deepEqual(asPlain(signals.at(-1)), ["herdr:blocked", { active: true, label: "permission: Allow this command?" }]);
 				if (confirmError) throw confirmError;
 				return answer === null ? undefined : answer;
 			},
 		},
-	};
-	const call = (toolName, input) => handlers.get("tool_call")({ toolName, input }, ctx);
-	return { call, signals, asked, summaries };
+	});
+	const ctx = ctxFor();
+	const call = (toolName, input, callSignal) => handlers.get("tool_call")({ toolName, input }, callSignal ? ctxFor(callSignal) : ctx);
+	return { call, signals, asked, summaries, dialogs, dialogEvents, shutdown: () => handlers.get("session_shutdown")({}, ctxFor()), maxOpen: () => maxOpenDialogs, openCount: () => openDialogs, current: () => dialogs.findLast(dialog => !dialog.closed) };
 }
 
 test("guard: an allowed command runs and clears the blocked signal", async () => {
@@ -1107,4 +1424,164 @@ test("guard: print and JSON runs block without asking; safe and non-shell calls 
 	assert.equal(run.summaries.length, 0);
 	assert.equal((await run.call("powershell", { command: "Remove-Item x" })), undefined);
 	assert.equal(run.asked.length, 1);
+});
+
+// The queue tests drive deferred dialogs by hand, the way codemode's concurrent
+// nested calls arrive: several flagged commands enter the handler together.
+// `current()` is the one open dialog; `settle()` lets the queue advance.
+const settle = () => new Promise(resolve => setImmediate(resolve));
+
+test("guard queue: two concurrent commands ask one at a time and both settle", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm -rf dist" });
+	const second = run.call("bash", { command: "rm -rf build" });
+	await settle();
+	assert.equal(run.dialogs.length, 1, "Only the first command opens a question");
+	assert.ok(run.dialogs[0].title.includes("rm -rf dist"));
+	run.dialogs[0].answer("Yes");
+	assert.equal(await first, undefined, "The first command is allowed");
+	await settle();
+	assert.equal(run.dialogs.length, 2, "The second question opens only after the first settles");
+	assert.ok(run.current().title.includes("rm -rf build"));
+	run.current().answer("No");
+	assert.equal((await second).block, true, "The second command is declined after its own question");
+	assert.equal(run.maxOpen(), 1, "At most one dialog is ever open");
+	assert.deepEqual(run.dialogEvents, [
+		{ type: "open", kind: "select" }, { type: "close", kind: "select" },
+		{ type: "open", kind: "select" }, { type: "close", kind: "select" },
+	]);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+});
+
+test("guard queue: three commands survive a failed question in the middle", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
+	const third = run.call("bash", { command: "rm c" });
+	await settle();
+	run.current().answer("Yes");
+	assert.equal(await first, undefined);
+	await settle();
+	run.current().fail(new Error("dialog closed"));
+	await assert.rejects(second, /dialog closed/);
+	await settle();
+	assert.ok(run.current().title.includes("rm c"), "The queue keeps going after a failed question");
+	run.current().answer("Yes");
+	assert.equal(await third, undefined);
+	assert.equal(run.maxOpen(), 1);
+});
+
+test("guard queue: cancelling while waiting blocks the command without opening a question", async () => {
+	const run = guardRun({ defer: true });
+	const firstController = new AbortController();
+	const secondController = new AbortController();
+	const first = run.call("bash", { command: "rm a" }, firstController.signal);
+	const second = run.call("bash", { command: "rm b" }, secondController.signal);
+	await settle();
+	assert.equal(run.dialogs.length, 1);
+	// The queued call is cancelled while the first question is still open.
+	secondController.abort();
+	assert.equal((await second).block, true, "The queued call settles blocked, before the open question does");
+	assert.equal(run.dialogs.length, 1, "No question opened for the cancelled call");
+	assert.equal(run.maxOpen(), 1);
+	// The cancelled call must not clear the first question's Herdr status.
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: true, label: "permission: Allow this command?" }]);
+	// A run that arrives already cancelled never queues either.
+	const lateController = new AbortController();
+	lateController.abort();
+	assert.equal((await run.call("bash", { command: "rm b" }, lateController.signal)).block, true);
+	run.current().answer("No");
+	assert.equal((await first).block, true);
+	assert.equal(run.dialogs.length, 1, "Still only one question was ever opened");
+});
+
+test("guard queue: cancelling during a dialog blocks that command", async () => {
+	const run = guardRun({ defer: true });
+	const controller = new AbortController();
+	const call = run.call("bash", { command: "rm a" }, controller.signal);
+	await settle();
+	controller.abort(); // The open dialog resolves undefined, as Pi's selectors do.
+	assert.equal((await call).block, true, "A cancelled question never allows the command");
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+	assert.equal(run.dialogs.length, 1);
+});
+
+test("guard queue: a typed reply holds the queue until it is submitted", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
+	await settle();
+	run.current().answer("Type a reply");
+	await settle();
+	assert.equal(run.current().kind, "input", "The reply dialog opens");
+	assert.equal(run.maxOpen(), 1, "The reply dialog replaces the question, still one at a time");
+	// The second command cannot open its question while the reply is pending.
+	await settle();
+	assert.equal(run.dialogs.length, 2);
+	run.current().answer("Keep a. Delete only b.");
+	const result = await first;
+	assert.equal(result.block, true);
+	assert.match(result.reason, /User reply:\nKeep a\. Delete only b\./);
+	await settle();
+	assert.ok(run.current().title.includes("rm b"), "The second question opens after the reply");
+	run.current().answer("No");
+	assert.equal((await second).block, true);
+	assert.equal(run.maxOpen(), 1);
+});
+
+test("guard queue: shutdown blocks waiting calls, frees the queue, and blocks stale ones", async () => {
+	const run = guardRun({ defer: true });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
+	await settle();
+	run.shutdown();
+	// Every in-flight interaction settles blocked; none of them runs a command.
+	assert.equal((await first).block, true);
+	assert.equal((await second).block, true);
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
+	assert.equal(run.dialogs.length, 1, "The queued question never opened");
+	// The shut-down session's dialog resolves the way a destroyed UI does.
+	run.dialogs[0].aborts();
+	// The replacement session can ask again; an old queued request cannot.
+	const third = run.call("bash", { command: "rm c" });
+	await settle();
+	assert.ok(run.current().title.includes("rm c"), "The replacement session's question opens");
+	run.current().answer("No");
+	assert.equal((await third).block, true);
+	assert.equal(run.maxOpen(), 1);
+});
+
+test("guard queue: Pi's real extension selector resolves only one dialog at a time", async t => {
+	// Documents why the queue exists: InteractiveMode has a single editor slot,
+	// so a second selector opened on top of the first displaces it without
+	// resolving its promise. Uses Pi's real selector with a fake editor; no real
+	// session is started and no command runs.
+	const piRoot = realpathSync(installedPackage);
+	const { initTheme } = await import(new URL("./dist/modes/interactive/theme/theme.js", pathToFileURL(piRoot)));
+	initTheme("system");
+	const { InteractiveMode } = await import(new URL("./dist/modes/interactive/interactive-mode.js", pathToFileURL(piRoot)));
+	const blocked = [];
+	const added = [];
+	const mode = {
+		extensionSelector: undefined,
+		activeSelectorDispose: undefined,
+		activeSelectorToken: undefined,
+		disposeActiveSelector: InteractiveMode.prototype.disposeActiveSelector,
+		editorContainer: { clear() { added.length = 0; }, addChild(component) { added.push(component); } },
+		ui: { setFocus() {}, requestRender() {} },
+		programStatus: { setBlocked: (key, value) => blocked.push([key, value]) },
+	};
+	const select = InteractiveMode.prototype.showExtensionSelector.bind(mode);
+	const first = select("Allow this command?\n\nfirst", ["Yes", "No"]);
+	await settle();
+	t.assert.equal(added.length, 1);
+	const second = select("Allow this command?\n\nsecond", ["Yes", "No"]);
+	await settle();
+	// The displaced selector's promise never settles: this is the hang the queue
+	// prevents by never opening a second question.
+	let firstSettled = false;
+	void first.then(() => { firstSettled = true; });
+	await settle();
+	t.assert.equal(firstSettled, false);
+	t.assert.equal(blocked.at(-1)[1].message, "Allow this command?\n\nsecond");
 });

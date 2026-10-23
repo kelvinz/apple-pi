@@ -12,19 +12,22 @@
  *    extension statuses) in plain language, plus the model's average output
  *    speed over the last 10 replies.
  * 3. A small "→ using <tool> — <path>" title above each tool block when a path
- *    is available. The built-in call and result rendering stay in place, so
- *    expand/collapse is untouched.
+ *    is available. A renderer resolver adds it, so the registered tool (and
+ *    its execute function) stays Pi's or another extension's; the call body,
+ *    result, and expand/collapse rendering stay in place.
  * 4. A small italic title above assistant text ("✦ reply") and thinking
  *    ("… thinking") blocks. Display-only; user messages stay untouched.
  * 5. A right-aligned previous-user-message button above the fullscreen editor.
  * 6. Fullscreen copy joins lines that the transcript wrapped at its width, so
  *    a copied paragraph pastes as one line. Intentional breaks stay. Inside
  *    Herdr, selections go through the terminal to the viewing computer's clipboard.
+ *    Shutdown restores Pi's normal copying.
  * 7. Usage-limit errors automatically resume after reset + one minute.
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
- * 8. Shell commands that delete files or discard work ask first. Print and
- *    JSON runs block them. A blocked-state event is sent to Herdr meanwhile.
+ * 8. Shell commands that delete files or discard work ask first, one question
+ *    at a time. Print and JSON runs block them. A blocked-state event is sent
+ *    to Herdr meanwhile.
  *
  * Plan data refreshes when you send a message, after each turn, when the
  * agent settles, when you change model, and on /usage, but not more than
@@ -37,19 +40,7 @@
  *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (OAuth from /login)
  */
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import {
-	createBashToolDefinition,
-	createEditToolDefinition,
-	createFindToolDefinition,
-	createGrepToolDefinition,
-	createLsToolDefinition,
-	createPowerShellToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
-	getAgentDir,
-	SettingsManager,
-	UserMessageComponent,
-} from "@earendil-works/pi-coding-agent";
+import { getAgentDir, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { join, sep } from "node:path";
@@ -89,8 +80,6 @@ export function formatReset(row: Row, now = Date.now()): string {
 // `stale` marks rows kept from an earlier fetch after a refresh failed.
 type ProviderStatus = { plan?: string; rows: Row[]; note?: string; stale?: string };
 type WarningCategory = "snapshot" | "footer" | "tool-render" | "registration";
-type BuiltinToolDefinition = ToolDefinition<any, any, any>;
-type BuiltinToolFactory = (cwd: string, options?: any) => BuiltinToolDefinition;
 type ToolCallRenderer = NonNullable<ToolDefinition["renderCall"]>;
 type ToolCallArgs = Parameters<ToolCallRenderer>[0];
 type ToolCallContext = Parameters<ToolCallRenderer>[2];
@@ -175,13 +164,19 @@ export function reflowText(text: string, room: number, pad = 0, startCol = 0): s
 }
 
 const ORIGINAL_COPY = Symbol.for("apple-pi.copySelection");
+const COPY_PATCH = Symbol.for("apple-pi.copyPatch");
 // Same encoded-payload ceiling as Pi's built-in terminal clipboard writer.
 const MAX_CLIPBOARD_BASE64_LENGTH = 100_000;
 type CopySelection = (text: string) => Promise<boolean | string>;
+// Plain object on purpose: Pi's forwarding Proxy returns every function
+// property as a fresh closure, but passes non-function values through, so this
+// state is readable and comparable even through the Proxy.
+type CopyPatchState = { token: object; original: CopySelection; receiver: unknown; wrapper: CopySelection; identityHolds: boolean };
 // Pi exposes no public copy hook. These fields exist on the fullscreen TUI only.
 type CopyTui = {
 	copySelection?: CopySelection;
 	[ORIGINAL_COPY]?: CopySelection;
+	[COPY_PATCH]?: CopyPatchState;
 	getSelectionBounds?: () => { start: { col: number; scrollView?: unknown } } | undefined;
 	currentLayout?: { root: TranscriptLayoutBox };
 };
@@ -194,13 +189,24 @@ type CopyTui = {
  * so Pi may otherwise report success from writing only the remote clipboard.
  * Route selections through Herdr's terminal forwarding instead, for both local
  * and remote panes. Leave Pi's native route unchanged outside Herdr.
+ *
+ * Returns an idempotent cleanup that restores the previous callback, so
+ * removing the extension cannot leave this copy behavior installed (Pi reuses
+ * its renderer across a same-mode reload). Cleanup never overwrites a newer
+ * apple-pi patch, and on a raw TUI it leaves another extension's callback in
+ * place; through Pi's forwarding Proxy function identity cannot be read, so
+ * ownership there is the recorded patch state.
  */
-export function patchCopyReflow(tui: TUI, outputPad: () => number): void {
+export function patchCopyReflow(tui: TUI, outputPad: () => number): () => void {
 	const t = tui as unknown as CopyTui;
-	const original = t[ORIGINAL_COPY] ?? t.copySelection;
-	if (typeof original !== "function") return;
-	t[ORIGINAL_COPY] = original;
-	t.copySelection = async text => {
+	// An earlier apple-pi patch still holds the pristine callback; chain to it,
+	// never to another apple-pi wrapper.
+	const previous = t[COPY_PATCH];
+	const original = previous?.original ?? t[ORIGINAL_COPY] ?? t.copySelection;
+	if (typeof original !== "function") return () => {};
+	const receiver = t;
+	const state: CopyPatchState = { token: {}, original, receiver, wrapper: undefined!, identityHolds: false };
+	state.wrapper = async text => {
 		let copied = text;
 		try {
 			// Only selections in a scroll view (the transcript) have a known wrap width.
@@ -229,7 +235,33 @@ export function patchCopyReflow(tui: TUI, outputPad: () => number): void {
 				return "Could not send the selection to your terminal clipboard.";
 			}
 		}
-		return original(copied);
+		// Keep the original callback's receiver, not this wrapper's caller's.
+		return original.call(receiver, copied);
+	};
+	t[COPY_PATCH] = state;
+	t[ORIGINAL_COPY] = original;
+	t.copySelection = state.wrapper;
+	// A raw TUI reads the installed function back unchanged; Pi's forwarding
+	// Proxy returns a fresh closure for every function read.
+	state.identityHolds = t.copySelection === state.wrapper;
+	let done = false;
+	return () => {
+		if (done) return;
+		done = true;
+		// A newer apple-pi installation owns the callback now: leave it alone.
+		if (t[COPY_PATCH] !== state) return;
+		t[COPY_PATCH] = undefined;
+		if (state.identityHolds) {
+			// Raw TUI: restore only while our wrapper is still the installed
+			// callback, so another extension's replacement survives our cleanup.
+			if (t.copySelection === state.wrapper) t.copySelection = original;
+		} else {
+			// Forwarding Proxy: function identity cannot be compared there. The
+			// patch state above says apple-pi still owns the slot; widget
+			// factories reinstall after a reload, so anything layered later by
+			// another extension re-installs itself too.
+			t.copySelection = original;
+		}
 	};
 }
 
@@ -615,32 +647,119 @@ async function summarizeCommand(command: string, shell: string, ctx: ExtensionCo
 	}
 }
 
+// Nested shell calls can reach the permission handler together (codemode runs
+// tool calls concurrently), and Pi's terminal UI has one editor dialog slot: a
+// second question opened on top of the first replaces it without resolving the
+// first promise, and the run can then wait forever. Flagged questions are
+// therefore asked one at a time; safe commands and headless runs never queue.
+type GuardDecision = { block: true; reason: string } | undefined;
+type GuardJob = {
+	declined: GuardDecision;
+	settle: (value: GuardDecision) => void;
+	fail: (error: unknown) => void;
+	stale: () => boolean;
+	dispose: () => void;
+	run: () => Promise<GuardDecision>;
+};
+
 export function installDestructiveGuard(pi: ExtensionAPI): void {
+	const waiting: GuardJob[] = [];
+	let active: GuardJob | undefined;
+	// Bumped on shutdown: questions queued by an old session must not open in
+	// its replacement, and shutdown cancels whatever is still waiting.
+	let generation = 0;
+
+	function pump(): void {
+		if (active || waiting.length === 0) return;
+		const job = active = waiting.shift()!;
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			if (active === job) active = undefined;
+			job.dispose();
+			// Start the next question only after this one fully settles, so a
+			// rejection here can never poison the rest of the queue.
+			pump();
+		};
+		job.run().then(job.settle, job.fail).then(release, release);
+	}
+
+	pi.on("session_shutdown", () => {
+		generation++;
+		for (const job of waiting.splice(0)) {
+			job.dispose();
+			job.settle(job.declined);
+		}
+		// A dialog on a UI that is gone may never settle; block its command and
+		// free the queue for the session that takes over.
+		if (active) {
+			active.settle(active.declined);
+			active = undefined;
+		}
+		pi.events.emit("herdr:blocked", { active: false });
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (!SHELL_TOOLS.has(event.toolName)) return undefined;
 		const command = String((event.input as { command?: unknown }).command ?? "");
 		const reason = destructiveReason(command);
 		if (!reason) return undefined;
-		const declined = { block: true, reason: `Command stopped. ${reason} Permission was not given. Do not try another way to run it. Ask the user first.` };
+		const declined = { block: true as const, reason: `Command stopped. ${reason} Permission was not given. Do not try another way to run it. Ask the user first.` };
 		// Print and JSON runs have nobody to ask.
 		if (!ctx.hasUI) return declined;
-		// Tell Herdr that a permission question is waiting.
-		pi.events.emit("herdr:blocked", { active: true, label: "permission: Allow this command?" });
-		try {
-			const summary = await summarizeCommand(command, event.toolName, ctx);
-			if (ctx.signal?.aborted) return declined;
-			const message = `Allow this command?\n\n${summary}\n\nCommand:\n${command}`;
-			const choice = await ctx.ui.select(message, ["Yes", "No", "Type a reply"], { signal: ctx.signal });
-			if (ctx.signal?.aborted) return declined;
-			if (choice === "Yes") return undefined;
-			if (choice === "Type a reply") {
-				const reply = await ctx.ui.input("What should the agent do instead?", undefined, { signal: ctx.signal });
-				if (reply?.trim()) return { block: true, reason: `${declined.reason}\n\nUser reply:\n${reply.trim()}` };
-			}
-			return declined;
-		} finally {
-			pi.events.emit("herdr:blocked", { active: false });
-		}
+		// This run's signal, read once: the live ctx can point at a newer run by
+		// the time a queued question finally opens.
+		const signal = ctx.signal;
+		// A run cancelled before it arrives blocks immediately, without waiting
+		// behind the question that is already open.
+		if (signal?.aborted) return declined;
+		const token = generation;
+		return await new Promise<GuardDecision>((resolve, reject) => {
+			let settled = false;
+			const settle = (value: GuardDecision) => { if (!settled) { settled = true; resolve(value); } };
+			const fail = (error: unknown) => { if (!settled) { settled = true; reject(error); } };
+			const job: GuardJob = {
+				declined, settle, fail,
+				stale: () => token !== generation || signal?.aborted === true,
+				dispose: () => signal?.removeEventListener("abort", onAbort),
+				run: async () => {
+					// A question can go stale while queued: cancelled, or its session
+					// shut down. Block it without opening anything.
+					if (job.stale()) return declined;
+					// Tell Herdr that a permission question is waiting.
+					pi.events.emit("herdr:blocked", { active: true, label: "permission: Allow this command?" });
+					try {
+						const summary = await summarizeCommand(command, event.toolName, ctx);
+						if (job.stale()) return declined;
+						const message = `Allow this command?\n\n${summary}\n\nCommand:\n${command}`;
+						const choice = await ctx.ui.select(message, ["Yes", "No", "Type a reply"], { signal });
+						if (job.stale()) return declined;
+						if (choice === "Yes") return undefined;
+						if (choice === "Type a reply") {
+							const reply = await ctx.ui.input("What should the agent do instead?", undefined, { signal });
+							if (reply?.trim()) return { block: true, reason: `${declined.reason}\n\nUser reply:\n${reply.trim()}` };
+						}
+						return declined;
+					} finally {
+						pi.events.emit("herdr:blocked", { active: false });
+					}
+				},
+			};
+			// An abort while still waiting settles immediately, without a question.
+			// It must not clear the Herdr signal of the question that is open.
+			const onAbort = () => {
+				const position = waiting.indexOf(job);
+				if (position >= 0) {
+					waiting.splice(position, 1);
+					job.dispose();
+					settle(declined);
+				}
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			waiting.push(job);
+			pump();
+		});
 	});
 }
 
@@ -697,11 +816,6 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			return 1;
 		}
-	}
-
-	function envKey(name: string): string | undefined {
-		const v = process.env[name];
-		return v && v.trim() ? v.trim() : undefined;
 	}
 
 	// ---------- text helpers ----------
@@ -885,13 +999,20 @@ export default function (pi: ExtensionAPI) {
 	// Each entry reads its own credentials and returns a job, or undefined when
 	// that provider is not logged in. One table keeps the cache keys, the
 	// credential shapes, and the fetchers together.
-	const PROVIDERS: Record<string, (auth: Record<string, any>) => Promise<ProviderStatus> | undefined> = {
-		zai: auth => {
-			const key = auth?.zai?.type === "api_key" ? auth.zai.key : envKey("ZAI_API_KEY");
+	// Z.ai's key is resolved through Pi's own registry, so saved references to
+	// environment variables and credential commands work exactly as they do for
+	// chat requests; this code never interprets Pi's credential storage. A key
+	// Pi cannot resolve means the provider is not set up. Pi 1.3.0 reports a
+	// failed resolution (e.g. a credential command erroring) the same way; a
+	// rejection, should Pi ever surface one, propagates like a failed request
+	// and keeps the last good rows.
+	const PROVIDERS: Record<string, (ctx: ExtensionContext) => Promise<ProviderStatus | undefined> | undefined> = {
+		zai: async ctx => {
+			const key = await ctx.modelRegistry.getApiKeyForProvider("zai");
 			return key ? fetchZai(key) : undefined;
 		},
-		codex: auth => {
-			const cred = auth?.["openai-codex"];
+		codex: () => {
+			const cred = readAuth()["openai-codex"];
 			return cred?.type === "oauth" && cred.access
 				? fetchCodex(cred.access, typeof cred.accountId === "string" ? cred.accountId : undefined)
 				: undefined;
@@ -907,21 +1028,24 @@ export default function (pi: ExtensionAPI) {
 	// Returns true when provider data was actually re-read. Every failure ends as
 	// a note in the footer, so this never rejects: pi must not crash over a
 	// status line. The running fetch is kept so a caller can wait for it.
-	function fetchProvider(key: string, force: boolean): Promise<boolean> {
+	// `ctx` is the context of the event that asked for the data; credentials are
+	// resolved through it, never through a mutable global context.
+	function fetchProvider(key: string, force: boolean, ctx: ExtensionContext): Promise<boolean> {
 		if (inFlight.has(key)) return Promise.resolve(false);
 		if (!force && Date.now() - (lastFetch.get(key) ?? 0) < MIN_FETCH_GAP_MS) return Promise.resolve(false);
-		const job = readProvider(key).finally(() => inFlight.delete(key));
+		const job = readProvider(key, ctx).finally(() => inFlight.delete(key));
 		inFlight.set(key, job);
 		return job;
 	}
 
-	async function readProvider(key: string): Promise<boolean> {
+	async function readProvider(key: string, ctx: ExtensionContext): Promise<boolean> {
 		let next: ProviderStatus;
 		let failed = false;
 		try {
-			const job = PROVIDERS[key]?.(readAuth());
-			next = job ? await job : { rows: [], note: "not set up" };
-			failed = job !== undefined && next.rows.length === 0 && next.note !== undefined;
+			const job = PROVIDERS[key]?.(ctx);
+			const resolved = job === undefined ? undefined : await job;
+			next = resolved ?? { rows: [], note: "not set up" };
+			failed = resolved !== undefined && next.rows.length === 0 && next.note !== undefined;
 		} catch (e) {
 			next = { rows: [], note: e instanceof Error && e.name === "TimeoutError"
 				? "Usage request timed out; try /usage"
@@ -937,9 +1061,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Only the provider on screen is worth a request.
-	async function refresh(force: boolean): Promise<boolean> {
+	async function refresh(force: boolean, ctx: ExtensionContext): Promise<boolean> {
 		const key = activeKey();
-		return key ? await fetchProvider(key, force) : false;
+		return key ? await fetchProvider(key, force, ctx) : false;
 	}
 
 	// ---------- session totals (footer) ----------
@@ -1307,70 +1431,43 @@ export default function (pi: ExtensionAPI) {
 			: "";
 	}
 
-	// A registered tool replaces Pi's own, so it must be built the way Pi builds
-	// it: with the user's settings. Without them, shellCommandPrefix, shellPath,
-	// and image auto-resize would silently stop applying. Project settings count
-	// only when Pi trusts the project: shellCommandPrefix runs before every
-	// command, so an untrusted repository must not be able to set it.
-	function builtinToolOptions(ctx: ExtensionContext): { read?: object; bash?: object } {
-		try {
-			const projectTrusted = ctx.isProjectTrusted?.() === true;
-			const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted });
-			return {
-				read: { autoResizeImages: settings.getImageAutoResize() },
-				bash: { commandPrefix: settings.getShellCommandPrefix(), shellPath: settings.getShellPath() },
-			};
-		} catch {
-			// A locked or unreadable settings file: the tools still work, without them.
-			reportWarning("registration");
-			return {};
-		}
-	}
+	// A renderer resolver, not a tool registration: whichever tool Pi has
+	// registered for the name (its own, an SSH wrapper's, a sandbox's) keeps its
+	// execute function, schema, and activation, because Pi lets the first
+	// registration of a name win. Only the call renderer gains the title line;
+	// the call body, result, and shell rendering below it stay exactly as they
+	// were, so expand/collapse keeps working as before.
+	const DECORATED_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
 
-	function installToolHeaders(ctx: ExtensionContext): void {
-		// Built-in tools use different TypeBox schemas, so this table keeps one
-		// permissive boundary while the renderer callback uses public ToolDefinition types.
-		const factories: Array<[string, BuiltinToolFactory]> = [
-			["read", createReadToolDefinition],
-			["bash", createBashToolDefinition],
-			["edit", createEditToolDefinition],
-			["write", createWriteToolDefinition],
-			["grep", createGrepToolDefinition],
-			["find", createFindToolDefinition],
-			["ls", createLsToolDefinition],
-			["powershell", createPowerShellToolDefinition],
-		];
-		const options = builtinToolOptions(ctx);
-		for (const [name, factory] of factories) {
-			try {
-				const builtin = factory(ctx.cwd, (options as Record<string, object | undefined>)[name]);
-				pi.registerTool({
-					...builtin,
-					renderCall(args: ToolCallArgs, theme: Theme, context: ToolCallContext) {
-						const container = new Container();
-						const target = safeToolTarget(args);
-						container.addChild(new Text(themeText(theme).fg("dim", `→ using ${name}${target ? ` — ${target}` : ""}`), 0, 0));
-						try {
-							// Pi remembers our wrapper, but the built-in renderer must receive
-							// its own previous component (Text, Box, etc.), not that wrapper.
-							const previous = context?.lastComponent;
-							const inner = builtin.renderCall?.(args, theme, {
-								...context,
-								lastComponent: previous instanceof Container ? previous.children[1] : undefined,
-							});
-							if (inner) container.addChild(inner);
-						} catch {
-							reportWarning("tool-render");
-							// Built-in call rendering failed — the header alone still shows.
-						}
-						return container;
-					},
-				});
-			} catch {
-				reportWarning("registration");
-				// Tool unavailable in this environment — skip it.
-			}
-		}
+	function installToolHeaders(pi: ExtensionAPI): void {
+		pi.registerToolRenderer((name, next) => {
+			const renderers = next();
+			const baseRenderCall = renderers?.renderCall;
+			// Undecorated tools, and tools with no call renderer, pass through as-is.
+			if (!DECORATED_TOOLS.has(name) || !baseRenderCall) return renderers;
+			return {
+				...renderers,
+				renderCall(args: ToolCallArgs, theme: Theme, context: ToolCallContext) {
+					const container = new Container();
+					const target = safeToolTarget(args);
+					container.addChild(new Text(themeText(theme).fg("dim", `→ using ${name}${target ? ` — ${target}` : ""}`), 0, 0));
+					try {
+						// Pi remembers our wrapper, but the renderer below must receive
+						// its own previous component (Text, Box, etc.), not that wrapper.
+						const previous = context?.lastComponent;
+						const inner = baseRenderCall.call(renderers, args, theme, {
+							...context,
+							lastComponent: previous instanceof Container ? previous.children[1] : undefined,
+						});
+						if (inner) container.addChild(inner);
+					} catch {
+						reportWarning("tool-render");
+						// The renderer below failed — the header alone still shows.
+					}
+					return container;
+				},
+			};
+		});
 	}
 
 	// ---------- assistant block headers ----------
@@ -1388,6 +1485,7 @@ export default function (pi: ExtensionAPI) {
 	// ---------- wiring ----------
 
 	installDestructiveGuard(pi);
+	installToolHeaders(pi);
 	installAutoResume(pi, async ctx => {
 		const key = ctx.model ? PROVIDER_KEYS[ctx.model.provider] : undefined;
 		if (!key) return undefined;
@@ -1395,12 +1493,17 @@ export default function (pi: ExtensionAPI) {
 		// started before the limit was hit. Let it finish, then fetch again, so
 		// old data is never mistaken for a fresh reset.
 		while (inFlight.has(key)) await inFlight.get(key);
-		return await fetchProvider(key, true) ? cache.get(key) : undefined;
+		return await fetchProvider(key, true, ctx) ? cache.get(key) : undefined;
 	});
 
+	let copyCleanup: (() => void) | undefined;
 	pi.on("session_shutdown", () => {
 		sessionActive = false;
 		warningContext = undefined;
+		// Pi reuses its renderer across a same-mode reload, so removing apple-pi
+		// must restore normal copying itself.
+		copyCleanup?.();
+		copyCleanup = undefined;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1409,16 +1512,17 @@ export default function (pi: ExtensionAPI) {
 		updateSnapshot(ctx);
 		clearSpeed();
 		installFooter(ctx);
-		installToolHeaders(ctx);
 		if (ctx.mode === "tui") {
 			// This widget factory is also the only way to receive the live TUI.
 			ctx.ui.setWidget("apple-pi-previous-message", (tui, theme) => {
-				patchCopyReflow(tui, outputPad);
+				// A repeated factory call replaces the earlier installation first.
+				copyCleanup?.();
+				copyCleanup = patchCopyReflow(tui, outputPad);
 				return createPreviousMessageWidget(tui, theme, () => ctx.ui.notify("Previous-message navigation is unavailable in this Pi layout.", "warning"));
 			}, { placement: "aboveEditor" });
 		}
 		// Do not hold up the session start for a web call.
-		void refresh(true);
+		void refresh(true, ctx);
 	});
 
 	pi.on("message_start", event => {
@@ -1440,13 +1544,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (event.message?.role !== "user") return;
 		updateSnapshotAndRender(ctx);
-		void refresh(false);
+		void refresh(false, ctx);
 	});
 
 	// Run settled: refetch provider data (at most once a minute) and render.
 	pi.on("agent_settled", async (_event, ctx) => {
 		updateSnapshotAndRender(ctx);
-		await refresh(false);
+		await refresh(false, ctx);
 	});
 
 	// Each turn's tokens, cost, and context land in the session here, so the
@@ -1454,7 +1558,7 @@ export default function (pi: ExtensionAPI) {
 	// Usage follows too, at most once a minute. The fetch does not hold up the run.
 	pi.on("turn_end", async (_event, ctx) => {
 		updateSnapshotAndRender(ctx);
-		void refresh(false);
+		void refresh(false, ctx);
 	});
 
 	// Model switch swaps which plan row is shown and the footer's right side.
@@ -1463,7 +1567,7 @@ export default function (pi: ExtensionAPI) {
 		clearSpeed();
 		updateSnapshotAndRender(ctx);
 		// A different provider may have no data in the cache yet.
-		await refresh(false);
+		await refresh(false, ctx);
 	});
 
 	// Thinking level sits on the right of the footer too.
@@ -1489,7 +1593,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			updateSnapshot(ctx);
 			const key = activeKey();
-			const fetched = await refresh(true);
+			const fetched = await refresh(true, ctx);
 			try {
 				ctx.ui.notify(
 					fetched
