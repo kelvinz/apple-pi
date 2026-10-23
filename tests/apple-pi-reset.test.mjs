@@ -1392,7 +1392,7 @@ test("guard: ordinary commands, read-only git, and words inside arguments run un
 	]) assert.equal(destructiveReason(command), undefined, command);
 });
 
-function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false } = {}) {
+function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false, select } = {}) {
 	const extension = loadExtension({}, { status: 200 }, clock);
 	const handlers = new Map();
 	const signals = [];
@@ -1451,6 +1451,7 @@ function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputErro
 			},
 			select: async (title, options, opts) => {
 				asked.push([title, options]);
+				if (select) return select(title, options, opts);
 				if (defer) return deferredDialog("select", title, opts);
 				// The blocked signal is active while the question is open.
 				assert.deepEqual(asPlain(signals.at(-1)), ["herdr:blocked", { active: true, label: "permission: Allow this command?" }]);
@@ -1705,37 +1706,50 @@ test("guard queue: shutdown blocks waiting calls, frees the queue, and blocks st
 	assert.equal(run.maxOpen(), 1);
 });
 
-test("guard queue: Pi's real extension selector resolves only one dialog at a time", async t => {
-	// Documents why the queue exists: InteractiveMode has a single editor slot,
-	// so a second selector opened on top of the first displaces it without
-	// resolving its promise. Uses Pi's real selector with a fake editor; no real
-	// session is started and no command runs.
+test("guard queue: concurrent calls settle in order with Pi's real extension selector", async t => {
+	// Exercise the guard through Pi's real dialog lifecycle, not just deferred
+	// mocks. Pi 1.4.0 stacks dialogs; the guard still opens only one at a time.
+	// No real session is started and no command runs.
 	const piRoot = realpathSync(installedPackage);
 	const { initTheme } = await import(new URL("./dist/modes/interactive/theme/theme.js", pathToFileURL(piRoot)));
 	initTheme("system");
 	const { InteractiveMode } = await import(new URL("./dist/modes/interactive/interactive-mode.js", pathToFileURL(piRoot)));
 	const blocked = [];
 	const added = [];
-	const mode = {
+	// Inherit the real lifecycle helpers so this mock cannot omit a newly used
+	// helper such as pushExtensionDialog; only terminal/session state is fake.
+	const mode = Object.assign(Object.create(InteractiveMode.prototype), {
+		extensionDialogs: [],
 		extensionSelector: undefined,
 		activeSelectorDispose: undefined,
 		activeSelectorToken: undefined,
-		disposeActiveSelector: InteractiveMode.prototype.disposeActiveSelector,
+		editor: {},
 		editorContainer: { clear() { added.length = 0; }, addChild(component) { added.push(component); } },
 		ui: { setFocus() {}, requestRender() {} },
 		programStatus: { setBlocked: (key, value) => blocked.push([key, value]) },
-	};
-	const select = InteractiveMode.prototype.showExtensionSelector.bind(mode);
-	const first = select("Allow this command?\n\nfirst", ["Yes", "No"]);
+	});
+	const controller = new AbortController();
+	t.after(() => controller.abort());
+	const run = guardRun({ signal: controller.signal, select: mode.showExtensionSelector.bind(mode) });
+	const first = run.call("bash", { command: "rm a" });
+	const second = run.call("bash", { command: "rm b" });
 	await settle();
-	t.assert.equal(added.length, 1);
-	const second = select("Allow this command?\n\nsecond", ["Yes", "No"]);
+	assert.equal(run.asked.length, 1, "The second approval waits in the guard queue");
+	assert.match(blocked.at(-1)[1].message, /Command:\nrm a$/);
+	assert.equal(added.length, 1);
+	const firstSelector = added[0];
+	firstSelector.handleInput("\n"); // Yes
+	assert.equal(await first, undefined, "The first command is allowed");
 	await settle();
-	// The displaced selector's promise never settles: this is the hang the queue
-	// prevents by never opening a second question.
-	let firstSettled = false;
-	void first.then(() => { firstSettled = true; });
+	assert.equal(run.asked.length, 2, "The next approval opens after the first settles");
+	assert.match(blocked.at(-1)[1].message, /Command:\nrm b$/);
+	assert.equal(added.length, 1);
+	assert.notEqual(added[0], firstSelector);
+	added[0].handleInput("j"); // No
+	added[0].handleInput("\n");
+	assert.equal((await second).block, true, "The second command is blocked");
 	await settle();
-	t.assert.equal(firstSettled, false);
-	t.assert.equal(blocked.at(-1)[1].message, "Allow this command?\n\nsecond");
+	assert.deepEqual(added, [mode.editor], "The editor is restored after both approvals");
+	assert.equal(blocked.at(-1)[1], undefined, "Pi's dialog blocked status is cleared");
+	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
 });

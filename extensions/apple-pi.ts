@@ -659,10 +659,10 @@ async function summarizeCommand(command: string, shell: string, ctx: ExtensionCo
 }
 
 // Nested shell calls can reach the permission handler together (codemode runs
-// tool calls concurrently), and Pi's terminal UI has one editor dialog slot: a
-// second question opened on top of the first replaces it without resolving the
-// first promise, and the run can then wait forever. Flagged questions are
-// therefore asked one at a time; safe commands and headless runs never queue.
+// tool calls concurrently). Ask flagged questions one at a time so approvals
+// stay in command order instead of stacking in Pi's editor slot. This also
+// avoids stranding displaced dialogs on older Pi versions without a dialog
+// stack. Safe commands and headless runs never queue.
 type GuardDecision = { block: true; reason: string } | undefined;
 type GuardJob = {
 	declined: GuardDecision;

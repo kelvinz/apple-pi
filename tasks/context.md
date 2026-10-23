@@ -7,7 +7,7 @@
 ## Current state
 - OpenAI subscription quota support is implemented; no PRD was created for this user-requested change.
 - The footer keeps the `codex CLI` source label without a separate account/app-limit warning line; caveats remain in README.
-- All nine OpenAI tests pass. The existing real-selector test still fails against Pi 1.4.0 and is being repaired separately. Live rendering after `/reload` is not yet verified.
+- Full-suite verification after review fixes and the selector-test update: 101/101 passed, including all nine OpenAI tests. The old real-selector test assumed displaced dialogs could never settle; Pi 1.4.0 now stacks dialogs. Its replacement drives two concurrent guard calls through Pi's real selector lifecycle and verifies ordered allow/block decisions, editor restoration, and status cleanup. Live rendering after `/reload` is not yet verified.
 - Open question: whether Pi usage on an `openai` subscription model moves the Codex CLI percentage at all. Check by noting the percentage, running a few Pi turns, then `/usage`. If it never moves, revert to the plain "no usage endpoint" note with the `https://chatgpt.com/settings/usage` link.
 
 ## Key decisions
