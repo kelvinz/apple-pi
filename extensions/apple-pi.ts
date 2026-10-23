@@ -5,8 +5,9 @@
  *
  * 1. A footer showing the current provider's plan usage
  *    (windows with percent left, a countdown, and the local reset time).
- *    Codex and Z.ai only: Anthropic does not allow subscription use outside
- *    its own apps, and zai-coding-cn is the China-only plan.
+ *    Codex, OpenAI subscription (via Codex CLI quota), and Z.ai.
+ *    Anthropic does not allow subscription use outside its own apps,
+ *    and zai-coding-cn is the China-only plan.
  * 2. A friendlier replacement for the built-in footer: same data (directory,
  *    branch, session name, tokens, cost, context, model, thinking level,
  *    extension statuses) in plain language, plus the model's average output
@@ -37,17 +38,25 @@
  *
  * Data sources (same ones oh-my-pi uses):
  *   Z.ai    GET https://api.z.ai/api/monitor/usage/quota/limit
- *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (OAuth from /login)
+ *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (Codex OAuth)
+ *   OpenAI  Same quota endpoint, using a separate Codex CLI subscription login.
+ *           This is display-only; it cannot establish OpenAI app-specific limits.
  */
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, sep } from "node:path";
 
 const MIN_FETCH_GAP_MS = 60 * 1000;
 const FETCH_TIMEOUT_MS = 10 * 1000;
 const TOKEN_EXPIRED_NOTE = "token expired — run /login";
+const CODEX_CLI_SETUP_NOTE = "Codex CLI quota needs codex login · https://chatgpt.com/settings/usage";
+// The CLI refreshes its own token on use; apple-pi never does.
+const CODEX_CLI_EXPIRED_NOTE = "token expired — use codex or run codex login";
+// Notes carrying a command to run, wrapped so the command stays complete.
+const SETUP_NOTES = [TOKEN_EXPIRED_NOTE, CODEX_CLI_SETUP_NOTE, CODEX_CLI_EXPIRED_NOTE];
 const BAR_WIDTH = 10;
 // Built once: the footer re-renders on every frame, and building a formatter
 // per row per frame is the most expensive thing on that path.
@@ -77,8 +86,9 @@ export function formatReset(row: Row, now = Date.now()): string {
 	return `resets ${text} (${stamp})`;
 }
 
-// `stale` marks rows kept from an earlier fetch after a refresh failed.
-type ProviderStatus = { plan?: string; rows: Row[]; note?: string; stale?: string };
+// `stale` marks retained rows after a failed refresh; `unavailable` marks a
+// configuration change, which must clear old rows instead of retaining them.
+type ProviderStatus = { plan?: string; rows: Row[]; note?: string; stale?: string; unavailable?: boolean };
 type WarningCategory = "snapshot" | "footer" | "tool-render" | "registration";
 type ToolCallRenderer = NonNullable<ToolDefinition["renderCall"]>;
 type ToolCallArgs = Parameters<ToolCallRenderer>[0];
@@ -97,6 +107,7 @@ const WARNING_MESSAGES: Record<WarningCategory, string> = {
 const PROVIDER_KEYS: Record<string, string> = {
 	zai: "zai",
 	"openai-codex": "codex",
+	openai: "openai",
 };
 
 // Pi exposes no public transcript-layout getter. Keep this read-only adapter
@@ -889,12 +900,12 @@ export default function (pi: ExtensionAPI) {
 
 	// One request shape for both providers: same timeout, same JSON accept, and
 	// the same two failure notes. A response with no `json` carries a `note`.
-	async function getJson(url: string, headers: Record<string, string>): Promise<{ json?: any; note?: string }> {
+	async function getJson(url: string, headers: Record<string, string>, unauthorizedNote = TOKEN_EXPIRED_NOTE): Promise<{ json?: any; note?: string }> {
 		const res = await fetch(url, {
 			headers: { accept: "application/json", ...headers },
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		});
-		if (!res.ok) return { note: res.status === 401 ? TOKEN_EXPIRED_NOTE : `error ${res.status}` };
+		if (!res.ok) return { note: res.status === 401 ? unauthorizedNote : `error ${res.status}` };
 		return { json: await res.json() };
 	}
 
@@ -953,13 +964,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function fetchCodex(access: string, accountId?: string): Promise<ProviderStatus> {
+	async function fetchCodex(access: string, accountId?: string, unauthorizedNote = TOKEN_EXPIRED_NOTE): Promise<ProviderStatus> {
 		const acc = accountId ?? codexAccountId(access);
 		const { json, note } = await getJson("https://chatgpt.com/backend-api/wham/usage", {
 			authorization: `Bearer ${access}`,
 			"user-agent": "pi-usage-limits",
 			...(acc ? { "chatgpt-account-id": acc } : {}),
-		});
+		}, unauthorizedNote);
 		if (!json) return { rows: [], note };
 		const row = (w: any): Row => {
 			const secs = num(w?.limit_window_seconds);
@@ -1017,6 +1028,25 @@ export default function (pi: ExtensionAPI) {
 				? fetchCodex(cred.access, typeof cred.accountId === "string" ? cred.accountId : undefined)
 				: undefined;
 		},
+		openai: async () => {
+			const cred = readAuth()?.openai;
+			if (cred?.type !== "oauth" || !Array.isArray(cred.scopes) || !cred.scopes.includes("chatgpt.tokens.use.direct")) {
+				return { rows: [], note: "no usage endpoint", unavailable: true };
+			}
+			// The new direct token cannot read wham/usage. Read the separate CLI
+			// credential only for display; never refresh it or alter chat auth.
+			let cli: any;
+			try {
+				const home = process.env.CODEX_HOME || join(homedir(), ".codex");
+				cli = JSON.parse(readFileSync(join(home, "auth.json"), "utf8"));
+			} catch { /* Missing, unreadable, and malformed files are not configured. */ }
+			const access = cli?.tokens?.access_token;
+			if ((cli?.auth_mode !== undefined && cli.auth_mode !== "chatgpt") || typeof access !== "string" || !access.trim()) {
+				return { rows: [], note: CODEX_CLI_SETUP_NOTE, unavailable: true };
+			}
+			return fetchCodex(access, typeof cli.tokens.account_id === "string" ? cli.tokens.account_id : undefined,
+				CODEX_CLI_EXPIRED_NOTE);
+		},
 	};
 
 	// The usage cache key for the model in use, or undefined when that provider
@@ -1045,7 +1075,7 @@ export default function (pi: ExtensionAPI) {
 			const job = PROVIDERS[key]?.(ctx);
 			const resolved = job === undefined ? undefined : await job;
 			next = resolved ?? { rows: [], note: "not set up" };
-			failed = resolved !== undefined && next.rows.length === 0 && next.note !== undefined;
+			failed = resolved !== undefined && !next.unavailable && next.rows.length === 0 && next.note !== undefined;
 		} catch (e) {
 			next = { rows: [], note: e instanceof Error && e.name === "TimeoutError"
 				? "Usage request timed out; try /usage"
@@ -1152,7 +1182,7 @@ export default function (pi: ExtensionAPI) {
 		// still truncate, so an unbounded error cannot fill the whole footer.
 		const noteLine = (name: string, text: string): string[] => {
 			const line = `${fg("accent", name)}  ${fg("muted", text)}`;
-			return text.includes(TOKEN_EXPIRED_NOTE) ? wrapTextWithAnsi(line, width) : [truncate(line, width)];
+			return SETUP_NOTES.some(note => text.includes(note)) ? wrapTextWithAnsi(line, width) : [truncate(line, width)];
 		};
 
 		// Only show the plan that matches the model in use. Providers with no usage
@@ -1162,9 +1192,12 @@ export default function (pi: ExtensionAPI) {
 		if (!key) return providerLabel ? noteLine(providerLabel, "no usage endpoint") : [];
 		const status = cache.get(key);
 		if (!status) return [];
-		if (status.rows.length === 0) return noteLine(key, plainFooterText(status.note ?? "no limits reported"));
+		// OpenAI subscription quota comes from the Codex CLI login, so say so.
+		// API-key setups have no such source and keep the provider's own name.
+		const name = key === "openai" && !status.unavailable ? "codex CLI" : key;
+		if (status.rows.length === 0) return noteLine(name, plainFooterText(status.note ?? "no limits reported"));
 
-		const plan = status.plan ? `${key} ${plainFooterText(status.plan)}` : key;
+		const plan = status.plan ? `${name} ${plainFooterText(status.plan)}` : name;
 		const prefix = plan + "  ";
 		const rows = status.rows.map(r => ({ ...r, label: plainFooterText(r.label) }));
 		const labelPad = Math.max(...rows.map(r => visibleWidth(r.label)));
@@ -1208,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 				lines.push(...wrapTextWithAnsi(resetText, width - visibleWidth(resetIndent)).map(line => resetIndent + line));
 			}
 		});
-		if (status.stale) lines.push(...noteLine(key, `showing last result · ${plainFooterText(status.stale)}`));
+		if (status.stale) lines.push(...noteLine(name, `showing last result · ${plainFooterText(status.stale)}`));
 		return lines;
 	}
 
@@ -1488,7 +1521,8 @@ export default function (pi: ExtensionAPI) {
 	installToolHeaders(pi);
 	installAutoResume(pi, async ctx => {
 		const key = ctx.model ? PROVIDER_KEYS[ctx.model.provider] : undefined;
-		if (!key) return undefined;
+		// Codex CLI plan quota says nothing about direct-token app limits.
+		if (!key || key === "openai") return undefined;
 		// A running fetch (a footer refresh after a turn or a sent message) may have
 		// started before the limit was hit. Let it finish, then fetch again, so
 		// old data is never mistaken for a fresh reset.

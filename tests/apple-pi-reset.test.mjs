@@ -35,6 +35,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 	const exports = {};
 	const requests = [];
 	const sentHeaders = [];
+	const fileReads = [];
 	const piModule = {
 		getAgentDir: () => "/mock-agent",
 		UserMessageComponent: class {},
@@ -46,13 +47,23 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 			if (name === "@earendil-works/pi-coding-agent") return piModule;
 			if (name === "@earendil-works/pi-tui") return tui;
 			if (name === "node:fs") return {
-				readFileSync: () => JSON.stringify({
-					// A saved reference, as Pi stores for env-var/credential-command
-					// keys: this raw text must never reach a provider.
-					zai: { type: "api_key", key: "${ZAI_API_KEY}" },
-					"openai-codex": { type: "oauth", access: "test", accountId: "test" },
-				}),
+				readFileSync: path => {
+					fileReads.push(path);
+					if (state.files && Object.hasOwn(state.files, path)) {
+						const value = state.files[path];
+						if (value instanceof Error) throw value;
+						return typeof value === "string" ? value : JSON.stringify(value);
+					}
+					if (path === "/mock-agent/auth.json") return JSON.stringify({
+						// A saved reference, as Pi stores for env-var/credential-command
+						// keys: this raw text must never reach a provider.
+						zai: { type: "api_key", key: "${ZAI_API_KEY}" },
+						"openai-codex": { type: "oauth", access: "test", accountId: "test" },
+					});
+					throw new Error("ENOENT");
+				},
 			};
+			if (name === "node:os") return { homedir: () => "/mock-home" };
 			if (name === "node:path") return requirePi(name);
 			throw new Error(`Unexpected import: ${name}`);
 		},
@@ -70,7 +81,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 		},
 	});
 	assert.equal(exports.__JITI_ERROR__, undefined, "The extension must compile");
-	return { ...exports, requests, sentHeaders };
+	return { ...exports, requests, sentHeaders, fileReads };
 }
 
 const { formatReset, reflowText } = loadExtension();
@@ -142,7 +153,7 @@ const fixtures = {
 async function createFooter(provider, theme, status = 200, options = {}) {
 	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
-	const state = { status };
+	const state = { status, files: options.files };
 	const extension = loadExtension({ ...(fixture ? { [fixture.url]: fixture.response } : {}), ...options.responses }, state, options.clock, options.env);
 	const events = new Map();
 	const commands = new Map();
@@ -202,7 +213,7 @@ async function createFooter(provider, theme, status = 200, options = {}) {
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
 	assert.equal(extension.requests.length, options.expectRequests ?? (fixture ? 1 : 0));
-	return { footer, fixture, events, commands, ctx, entries, state, tools, toolRenderers, notices, prompts, requests: extension.requests, sentHeaders: extension.sentHeaders, apiKeyCalls };
+	return { footer, fixture, events, commands, ctx, entries, state, tools, toolRenderers, notices, prompts, requests: extension.requests, sentHeaders: extension.sentHeaders, fileReads: extension.fileReads, apiKeyCalls };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
@@ -377,6 +388,122 @@ test("zai auth: a provider switch during a pending resolution caches under the r
 	await run.events.get("model_select")({}, run.ctx);
 	assert.equal(run.requests.length, 2, "Switching back reuses the cached zai rows");
 	assert.ok(plainText(run.footer).includes("100% left"));
+});
+
+const openaiAuth = { openai: { type: "oauth", access: "direct-token-must-not-be-sent", scopes: ["chatgpt.tokens.use.direct"] } };
+const cliAuth = { auth_mode: "chatgpt", tokens: { access_token: "cli-token", account_id: "cli-account" } };
+const openaiFiles = cli => ({ "/mock-agent/auth.json": openaiAuth, "/mock-home/.codex/auth.json": cli });
+const openaiOptions = cli => ({
+	files: openaiFiles(cli),
+	responses: { [fixtures["openai-codex"].url]: fixtures["openai-codex"].response },
+	expectRequests: 1,
+});
+
+test("OpenAI subscription: separate CLI quota is labelled, width-safe, and refreshed without direct-token requests", async () => {
+	const run = await createFooter("openai", plainTheme, 200, openaiOptions(cliAuth));
+	assert.deepEqual(asPlain(run.sentHeaders[0].headers), {
+		accept: "application/json", authorization: "Bearer cli-token", "user-agent": "pi-usage-limits", "chatgpt-account-id": "cli-account",
+	});
+	const text = plainText(run.footer);
+	assert.ok(text.includes("codex CLI plus"));
+	assert.ok(text.includes("75% left"));
+	assert.ok(!text.includes("verify Codex CLI account"), "Account caveats stay in the README, not extra footer rows");
+	assert.ok(!text.includes("excludes app limits"));
+	assert.ok(text.includes("Sun 6 Oct, 18:30"));
+	for (const width of [0, 1, 10, 20, 40, 80, 160, 240]) {
+		assert.ok(run.footer.render(width).every(line => tui.visibleWidth(line) <= width), `Overflow at ${width}`);
+	}
+	await run.events.get("agent_settled")({}, run.ctx);
+	assert.equal(run.requests.length, 1, "Quota retains the one-minute refresh gap");
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.equal(run.requests.length, 2, "/usage forces a refresh");
+	assert.ok(run.sentHeaders.every(sent => sent.headers.authorization === "Bearer cli-token"));
+});
+
+test("OpenAI subscription: CODEX_HOME and legacy CLI files without auth_mode work", async () => {
+	const token = `header.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "jwt-account" } })).toString("base64url")}.signature`;
+	const run = await createFooter("openai", plainTheme, 200, {
+		...openaiOptions(cliAuth), env: { CODEX_HOME: "/custom-codex" },
+		files: { "/mock-agent/auth.json": openaiAuth, "/custom-codex/auth.json": { tokens: { access_token: token } } },
+	});
+	assert.equal(run.sentHeaders[0].headers["chatgpt-account-id"], "jwt-account");
+	assert.ok(run.fileReads.includes("/custom-codex/auth.json"));
+	assert.ok(!run.fileReads.includes("/mock-home/.codex/auth.json"));
+});
+
+test("OpenAI API keys, missing auth, and unrelated OAuth grants never read CLI credentials or send requests", async () => {
+	for (const auth of [{}, { openai: { type: "api_key", key: "sk-secret" } }, { openai: { type: "oauth", access: "other" } }, { openai: { type: "oauth", scopes: ["openid"] } }]) {
+		const run = await createFooter("openai", plainTheme, 200, { files: { ...openaiFiles(cliAuth), "/mock-agent/auth.json": auth } });
+		assert.equal(run.requests.length, 0);
+		assert.ok(plainText(run.footer).includes("openai  no usage endpoint"), "No CLI source, so no codex CLI label");
+		assert.ok(!run.fileReads.includes("/mock-home/.codex/auth.json"));
+	}
+});
+
+test("OpenAI subscription: absent, unreadable, malformed, and non-subscription CLI auth provide setup guidance", async () => {
+	for (const cli of [new Error("ENOENT"), new Error("EACCES"), "{bad json", null, {}, { tokens: { access_token: 42 } }, { tokens: { access_token: " " } }, { auth_mode: "apikey", tokens: cliAuth.tokens }]) {
+		const run = await createFooter("openai", plainTheme, 200, { files: openaiFiles(cli) });
+		assert.equal(run.requests.length, 0);
+		const text = plainText(run.footer);
+		assert.ok(text.includes("codex login"));
+		assert.ok(text.includes("https://chatgpt.com/settings/usage"));
+	}
+});
+
+test("OpenAI subscription: CLI 401 directs users to codex login, not Pi /login", async () => {
+	const run = await createFooter("openai", plainTheme, 401, openaiOptions(cliAuth));
+	assert.ok(plainText(run.footer).includes("codex CLI  token expired — use codex or run codex login"));
+	assert.ok(!plainText(run.footer).includes("/login"));
+	for (const width of [20, 40, 80]) {
+		const lines = run.footer.render(width);
+		assert.ok(lines.every(line => tui.visibleWidth(line) <= width));
+		assert.ok(lines.map(line => line.trim()).join(" ").includes("run codex login"), `Command wraps whole at width ${width}`);
+	}
+});
+
+test("OpenAI subscription: an expired CLI token keeps last quota under the codex CLI label", async () => {
+	const run = await createFooter("openai", plainTheme, 200, openaiOptions(cliAuth));
+	run.state.status = 401;
+	await run.commands.get("usage").handler("", run.ctx);
+	const text = plainText(run.footer);
+	assert.ok(text.includes("75% left"));
+	assert.ok(text.includes("codex CLI  showing last result · token expired — use codex or run codex login"));
+	assert.ok(!text.includes("openai  "));
+});
+
+test("OpenAI subscription: failed refresh retains quota, but removing CLI auth or changing auth type clears it", async () => {
+	const run = await createFooter("openai", plainTheme, 200, openaiOptions(cliAuth));
+	run.state.status = 500;
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.ok(plainText(run.footer).includes("75% left"));
+	assert.ok(plainText(run.footer).includes("showing last result · error 500"));
+	run.state.files["/mock-home/.codex/auth.json"] = {};
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.ok(!plainText(run.footer).includes("75% left"));
+	assert.ok(plainText(run.footer).includes("codex login"));
+	run.state.status = 200;
+	run.state.files["/mock-home/.codex/auth.json"] = cliAuth;
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.ok(plainText(run.footer).includes("75% left"));
+	run.state.files["/mock-agent/auth.json"] = { openai: { type: "api_key", key: "sk-test" } };
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.ok(!plainText(run.footer).includes("75% left"));
+	assert.ok(plainText(run.footer).includes("no usage endpoint"));
+});
+
+test("OpenAI subscription: CLI quota cache does not leak into legacy Codex usage", async () => {
+	const run = await createFooter("openai", plainTheme, 200, {
+		...openaiOptions(cliAuth), files: { ...openaiFiles(cliAuth), "/mock-agent/auth.json": { ...openaiAuth, "openai-codex": { type: "oauth", access: "pi-codex" } } },
+	});
+	run.ctx.model = { id: "test", provider: "openai-codex" };
+	await run.events.get("model_select")({}, run.ctx);
+	assert.equal(run.requests.length, 2);
+	assert.equal(run.sentHeaders[1].headers.authorization, "Bearer pi-codex");
+	assert.ok(!plainText(run.footer).includes("codex CLI"));
+	run.ctx.model = { id: "test", provider: "openai" };
+	await run.events.get("model_select")({}, run.ctx);
+	assert.equal(run.requests.length, 2);
+	assert.ok(plainText(run.footer).includes("codex CLI"));
 });
 
 test("providers without a usage endpoint make no request", async () => {
@@ -1168,6 +1295,33 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 	await run.events.get("session_shutdown")({}, run.ctx);
 	assert.equal(timers.size, 0);
 	assert.ok(!plainText(run.footer).includes("Auto-resume"));
+});
+
+test("auto-resume: OpenAI direct-token errors never use display-only Codex CLI reset times", async t => {
+	const timers = new Set();
+	const clock = {
+		t: now, now: () => clock.t,
+		setTimeout(fn, delay) { const timer = { fn, delay, unref() {} }; timers.add(timer); return timer; },
+		clearTimeout: timer => timers.delete(timer),
+	};
+	const response = structuredClone(fixtures["openai-codex"].response);
+	response.rate_limit.secondary_window = { limit_window_seconds: 7 * day, used_percent: 100, reset_at: (now + 3 * day * 1000) / 1000 };
+	const run = await createFooter("openai", plainTheme, 200, {
+		...openaiOptions(cliAuth), mode: "rpc", clock,
+		responses: { [fixtures["openai-codex"].url]: response },
+	});
+	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
+	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: "subscription_sharing_usage_limit_exceeded. Try again in ~22 min." } }, run.ctx);
+	await run.events.get("agent_settled")({}, run.ctx);
+	assert.equal(run.requests.length, 1, "Auto-resume does not fetch CLI quota as direct-token reset evidence");
+	assert.equal(timers.size, 1);
+	const fire = () => { const timer = [...timers][0]; timers.delete(timer); timer.fn(); };
+	clock.t = now + 23 * 60_000 - 1;
+	fire();
+	assert.deepEqual(run.prompts, [], "The error hint still gets its one-minute buffer");
+	clock.t++;
+	fire();
+	assert.deepEqual(run.prompts, ["continue"], "CLI weekly exhaustion cannot postpone the actual error hint");
 });
 
 test("auto-resume: a footer refresh still running at settlement is followed by a fresh fetch", async t => {
