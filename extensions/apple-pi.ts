@@ -831,11 +831,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function envKey(name: string): string | undefined {
-		const v = process.env[name];
-		return v && v.trim() ? v.trim() : undefined;
-	}
-
 	// ---------- text helpers ----------
 
 	const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
@@ -1017,13 +1012,20 @@ export default function (pi: ExtensionAPI) {
 	// Each entry reads its own credentials and returns a job, or undefined when
 	// that provider is not logged in. One table keeps the cache keys, the
 	// credential shapes, and the fetchers together.
-	const PROVIDERS: Record<string, (auth: Record<string, any>) => Promise<ProviderStatus> | undefined> = {
-		zai: auth => {
-			const key = auth?.zai?.type === "api_key" ? auth.zai.key : envKey("ZAI_API_KEY");
+	// Z.ai's key is resolved through Pi's own registry, so saved references to
+	// environment variables and credential commands work exactly as they do for
+	// chat requests; this code never interprets Pi's credential storage. A key
+	// Pi cannot resolve means the provider is not set up. Pi 1.3.0 reports a
+	// failed resolution (e.g. a credential command erroring) the same way; a
+	// rejection, should Pi ever surface one, propagates like a failed request
+	// and keeps the last good rows.
+	const PROVIDERS: Record<string, (ctx: ExtensionContext) => Promise<ProviderStatus | undefined> | undefined> = {
+		zai: async ctx => {
+			const key = await ctx.modelRegistry.getApiKeyForProvider("zai");
 			return key ? fetchZai(key) : undefined;
 		},
-		codex: auth => {
-			const cred = auth?.["openai-codex"];
+		codex: () => {
+			const cred = readAuth()["openai-codex"];
 			return cred?.type === "oauth" && cred.access
 				? fetchCodex(cred.access, typeof cred.accountId === "string" ? cred.accountId : undefined)
 				: undefined;
@@ -1039,21 +1041,24 @@ export default function (pi: ExtensionAPI) {
 	// Returns true when provider data was actually re-read. Every failure ends as
 	// a note in the footer, so this never rejects: pi must not crash over a
 	// status line. The running fetch is kept so a caller can wait for it.
-	function fetchProvider(key: string, force: boolean): Promise<boolean> {
+	// `ctx` is the context of the event that asked for the data; credentials are
+	// resolved through it, never through a mutable global context.
+	function fetchProvider(key: string, force: boolean, ctx: ExtensionContext): Promise<boolean> {
 		if (inFlight.has(key)) return Promise.resolve(false);
 		if (!force && Date.now() - (lastFetch.get(key) ?? 0) < MIN_FETCH_GAP_MS) return Promise.resolve(false);
-		const job = readProvider(key).finally(() => inFlight.delete(key));
+		const job = readProvider(key, ctx).finally(() => inFlight.delete(key));
 		inFlight.set(key, job);
 		return job;
 	}
 
-	async function readProvider(key: string): Promise<boolean> {
+	async function readProvider(key: string, ctx: ExtensionContext): Promise<boolean> {
 		let next: ProviderStatus;
 		let failed = false;
 		try {
-			const job = PROVIDERS[key]?.(readAuth());
-			next = job ? await job : { rows: [], note: "not set up" };
-			failed = job !== undefined && next.rows.length === 0 && next.note !== undefined;
+			const job = PROVIDERS[key]?.(ctx);
+			const resolved = job === undefined ? undefined : await job;
+			next = resolved ?? { rows: [], note: "not set up" };
+			failed = resolved !== undefined && next.rows.length === 0 && next.note !== undefined;
 		} catch (e) {
 			next = { rows: [], note: e instanceof Error && e.name === "TimeoutError"
 				? "Usage request timed out; try /usage"
@@ -1069,9 +1074,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Only the provider on screen is worth a request.
-	async function refresh(force: boolean): Promise<boolean> {
+	async function refresh(force: boolean, ctx: ExtensionContext): Promise<boolean> {
 		const key = activeKey();
-		return key ? await fetchProvider(key, force) : false;
+		return key ? await fetchProvider(key, force, ctx) : false;
 	}
 
 	// ---------- session totals (footer) ----------
@@ -1527,7 +1532,7 @@ export default function (pi: ExtensionAPI) {
 		// started before the limit was hit. Let it finish, then fetch again, so
 		// old data is never mistaken for a fresh reset.
 		while (inFlight.has(key)) await inFlight.get(key);
-		return await fetchProvider(key, true) ? cache.get(key) : undefined;
+		return await fetchProvider(key, true, ctx) ? cache.get(key) : undefined;
 	});
 
 	let copyCleanup: (() => void) | undefined;
@@ -1557,7 +1562,7 @@ export default function (pi: ExtensionAPI) {
 			}, { placement: "aboveEditor" });
 		}
 		// Do not hold up the session start for a web call.
-		void refresh(true);
+		void refresh(true, ctx);
 	});
 
 	pi.on("message_start", event => {
@@ -1579,13 +1584,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (event.message?.role !== "user") return;
 		updateSnapshotAndRender(ctx);
-		void refresh(false);
+		void refresh(false, ctx);
 	});
 
 	// Run settled: refetch provider data (at most once a minute) and render.
 	pi.on("agent_settled", async (_event, ctx) => {
 		updateSnapshotAndRender(ctx);
-		await refresh(false);
+		await refresh(false, ctx);
 	});
 
 	// Each turn's tokens, cost, and context land in the session here, so the
@@ -1593,7 +1598,7 @@ export default function (pi: ExtensionAPI) {
 	// Usage follows too, at most once a minute. The fetch does not hold up the run.
 	pi.on("turn_end", async (_event, ctx) => {
 		updateSnapshotAndRender(ctx);
-		void refresh(false);
+		void refresh(false, ctx);
 	});
 
 	// Model switch swaps which plan row is shown and the footer's right side.
@@ -1602,7 +1607,7 @@ export default function (pi: ExtensionAPI) {
 		clearSpeed();
 		updateSnapshotAndRender(ctx);
 		// A different provider may have no data in the cache yet.
-		await refresh(false);
+		await refresh(false, ctx);
 	});
 
 	// Thinking level sits on the right of the footer too.
@@ -1628,7 +1633,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			updateSnapshot(ctx);
 			const key = activeKey();
-			const fetched = await refresh(true);
+			const fetched = await refresh(true, ctx);
 			try {
 				ctx.ui.notify(
 					fetched

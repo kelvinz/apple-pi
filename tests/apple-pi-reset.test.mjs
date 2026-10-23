@@ -38,6 +38,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 	const requests = [];
 	const toolCalls = {};
 	const settingsCalls = [];
+	const sentHeaders = [];
 	const piModule = {
 		getAgentDir: () => "/mock-agent",
 		UserMessageComponent: class {},
@@ -64,7 +65,9 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 			if (name === "@earendil-works/pi-tui") return tui;
 			if (name === "node:fs") return {
 				readFileSync: () => JSON.stringify({
-					zai: { type: "api_key", key: "test" },
+					// A saved reference, as Pi stores for env-var/credential-command
+					// keys: this raw text must never reach a provider.
+					zai: { type: "api_key", key: "${ZAI_API_KEY}" },
 					"openai-codex": { type: "oauth", access: "test", accountId: "test" },
 				}),
 			};
@@ -78,13 +81,14 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 		process: { env },
 		fetch: async (url, options) => {
 			requests.push(url);
+			sentHeaders.push({ url, headers: options?.headers });
 			assert.ok(Object.hasOwn(responses, url), `Unexpected HTTP request: ${url}`);
 			await state.beforeResponse?.(options);
 			return { ok: state.status >= 200 && state.status < 300, status: state.status, json: async () => responses[url] };
 		},
 	});
 	assert.equal(exports.__JITI_ERROR__, undefined, "The extension must compile");
-	return { ...exports, requests, toolCalls, settingsCalls };
+	return { ...exports, requests, toolCalls, settingsCalls, sentHeaders };
 }
 
 const { formatReset, reflowText } = loadExtension();
@@ -157,7 +161,7 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	// Providers without a fixture have no usage endpoint, so nothing is requested.
 	const fixture = fixtures[provider];
 	const state = { status };
-	const extension = loadExtension(fixture ? { [fixture.url]: fixture.response } : {}, state, options.clock, options.env);
+	const extension = loadExtension({ ...(fixture ? { [fixture.url]: fixture.response } : {}), ...options.responses }, state, options.clock, options.env);
 	const events = new Map();
 	const commands = new Map();
 	const tools = [];
@@ -181,9 +185,20 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 		sendMessage: message => entries.push({ type: "custom_message", ...asPlain(message) }),
 	});
 	const notices = [];
+	const apiKeyCalls = [];
 	const ctx = {
 		mode: options.mode ?? "print", cwd: "/mock", hasUI: true, isProjectTrusted: () => projectTrusted, isIdle: () => true,
 		model: { id: "test", provider },
+		modelRegistry: {
+			getApiKeyForProvider: async requested => {
+				apiKeyCalls.push(requested);
+				if (options.zaiApiKey instanceof Error) throw options.zaiApiKey;
+				if (requested !== "zai") return undefined;
+				// null means Pi has no credential for zai.
+				if (options.zaiApiKey === null) return undefined;
+				return options.zaiApiKey ?? "test";
+			},
+		},
 		sessionManager: { getEntries: () => entries, getCwd: () => "/mock", getSessionId: () => "footer-thread" },
 		ui: {
 			setWidget(_key, factory) {
@@ -202,8 +217,8 @@ async function createFooter(provider, theme, status = 200, projectTrusted = true
 	};
 	await events.get("session_start")({}, ctx);
 	await new Promise(resolve => setImmediate(resolve));
-	assert.equal(extension.requests.length, fixture ? 1 : 0);
-	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, prompts, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests };
+	assert.equal(extension.requests.length, options.expectRequests ?? (fixture ? 1 : 0));
+	return { footer, fixture, events, commands, ctx, entries, state, tools, notices, prompts, toolCalls: extension.toolCalls, settingsCalls: extension.settingsCalls, requests: extension.requests, sentHeaders: extension.sentHeaders, apiKeyCalls };
 }
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
@@ -296,6 +311,88 @@ test("zai: a failed refresh keeps the last good rows and says they are old", asy
 	state.status = 200;
 	await commands.get("usage").handler("", ctx);
 	assert.ok(!plainText(footer).includes("showing last result"), "A good refresh clears the note");
+});
+
+// Z.ai credentials come from Pi's resolver, so saved references work and the
+// stored reference text itself is never sent to the provider.
+test("zai auth: a resolved literal key is sent as the bearer token", async () => {
+	const run = await createFooter("zai", plainTheme, 200, true, { zaiApiKey: "resolved-literal-key" });
+	assert.ok(plainText(run.footer).includes("100% left"));
+	assert.deepEqual(run.apiKeyCalls, ["zai"], "The key is asked from Pi's registry, for zai only");
+	assert.equal(run.sentHeaders.length, 1);
+	assert.equal(run.sentHeaders[0].headers.authorization, "Bearer resolved-literal-key");
+	assert.notEqual(run.sentHeaders[0].headers.authorization, "Bearer ${ZAI_API_KEY}");
+});
+
+test("zai auth: environment references and credential commands resolve through Pi", async () => {
+	for (const resolved of ["env-resolved-key", "command-resolved-key"]) {
+		const run = await createFooter("zai", plainTheme, 200, true, { zaiApiKey: resolved });
+		assert.equal(run.sentHeaders[0].headers.authorization, `Bearer ${resolved}`);
+		// The unresolved reference stored in auth.json is never the token.
+		assert.ok(run.sentHeaders.every(sent => !JSON.stringify(sent.headers).includes("ZAI_API_KEY")));
+	}
+});
+
+test("zai auth: missing credentials mean no request and a not-set-up note", async () => {
+	const run = await createFooter("zai", plainTheme, 200, true, { zaiApiKey: null, expectRequests: 0 });
+	assert.equal(run.requests.length, 0);
+	assert.deepEqual(run.apiKeyCalls, ["zai"]);
+	assert.ok(plainText(run.footer).includes("zai"), "The provider is still named");
+	assert.ok(plainText(run.footer).includes("not set up"));
+});
+
+test("zai auth: a failing resolver keeps the last good rows as stale", async () => {
+	const options = { zaiApiKey: "good-key" };
+	const run = await createFooter("zai", plainTheme, 200, true, options);
+	assert.ok(plainText(run.footer).includes("100% left"));
+	options.zaiApiKey = new Error("credential command failed");
+	await run.commands.get("usage").handler("", run.ctx);
+	const text = plainText(run.footer);
+	assert.ok(text.includes("100% left"), "The last good rows stay");
+	assert.ok(text.includes("showing last result · credential command failed"));
+	// A later successful lookup clears the stale note.
+	options.zaiApiKey = "good-key";
+	await run.commands.get("usage").handler("", run.ctx);
+	assert.ok(!plainText(run.footer).includes("showing last result"));
+});
+
+test("zai auth: a key Pi stops resolving replaces the rows with a not-set-up note", async () => {
+	// Pi 1.3.0's getApiKeyForProvider catches resolution errors and returns
+	// undefined, so a failing credential command arrives here as no key.
+	const options = { zaiApiKey: "good-key" };
+	const run = await createFooter("zai", plainTheme, 200, true, options);
+	assert.ok(plainText(run.footer).includes("100% left"));
+	options.zaiApiKey = null;
+	await run.commands.get("usage").handler("", run.ctx);
+	const text = plainText(run.footer);
+	assert.ok(text.includes("not set up"));
+	assert.ok(!text.includes("100% left"), "Rows Pi can no longer authenticate are not shown as current");
+	assert.equal(run.requests.length, 1, "No request is sent without a key");
+});
+
+test("zai auth: a provider switch during a pending resolution caches under the requested provider", async () => {
+	let resolveZai;
+	const options = { zaiApiKey: new Promise(resolve => { resolveZai = resolve; }) };
+	const codexFixture = fixtures["openai-codex"];
+	const run = await createFooter("zai", plainTheme, 200, true, {
+		...options,
+		expectRequests: 0,
+		responses: { [codexFixture.url]: codexFixture.response },
+	});
+	assert.equal(run.requests.length, 0, "The zai request waits for its key");
+	// The model switches to Codex while the zai key is still resolving.
+	run.ctx.model = { id: "test", provider: "openai-codex" };
+	await run.events.get("model_select")({}, run.ctx);
+	assert.ok(plainText(run.footer).includes("75% left"), "Codex data shows while zai is pending");
+	resolveZai("late-zai-key");
+	await new Promise(resolve => setImmediate(resolve));
+	// The late zai response is cached under zai, not under the provider on screen.
+	assert.equal(run.requests.length, 2);
+	assert.equal(run.sentHeaders.find(sent => sent.url.includes("api.z.ai")).headers.authorization, "Bearer late-zai-key");
+	run.ctx.model = { id: "test", provider: "zai" };
+	await run.events.get("model_select")({}, run.ctx);
+	assert.equal(run.requests.length, 2, "Switching back reuses the cached zai rows");
+	assert.ok(plainText(run.footer).includes("100% left"));
 });
 
 test("providers without a usage endpoint make no request", async () => {
