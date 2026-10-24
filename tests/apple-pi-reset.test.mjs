@@ -1161,19 +1161,40 @@ test("auto-resume: waiting messages and images join the transcript without chang
 	assert.deepEqual(run.prompts, ["continue"], "New input must not delay the original 23-minute deadline");
 });
 
-test("auto-resume: fresh exhausted main windows choose the later reset; unrelated buckets do not delay it", async t => {
-	const run = await createAutoResume(t, { usage: { rows: [
-		{ label: "5-hour", pct: 100, resetAt: now + hour * 1000 },
-		{ label: "weekly", pct: 100, resetAt: now + 7 * day * 1000 },
-		{ label: "reserve weekly", bucket: "reserve", pct: 100, resetAt: now + 30 * day * 1000 },
-		{ label: "other", pct: 25, resetAt: now + 60 * day * 1000 },
-	] } });
-	await run.error();
-	await run.emit("agent_settled");
-	run.jump(hour * 1000 + 60_000);
-	assert.deepEqual(run.prompts, []);
-	run.jump(6 * day * 1000 + 23 * hour * 1000);
-	assert.deepEqual(run.prompts, ["continue"]);
+test("auto-resume: without a hint, the first main-window reset wins; buckets and passed resets do not count", async t => {
+	const noHint = "You have hit your ChatGPT usage limit. Try again later.";
+	for (const [rows, minutes] of [
+		// The 5-hour window resets first, at any usage level.
+		[[{ label: "5-hour", pct: 40, resetAt: now + 3 * hour * 1000 }, { label: "weekly", pct: 100, resetAt: now + 7 * day * 1000 }], 3 * 60],
+		// A weekly reset also resets the 5-hour window.
+		[[{ label: "5-hour", pct: 100, resetAt: now + 3 * hour * 1000 }, { label: "weekly", pct: 100, resetAt: now + 30 * 60_000 }], 30],
+		[[
+			{ label: "reserve 5-hour", bucket: "reserve", pct: 100, resetAt: now + 10 * 60_000 },
+			{ label: "passed", pct: 100, resetAt: now - 60_000 },
+			{ label: "5-hour", pct: 100, resetAt: now + 2 * hour * 1000 },
+		], 2 * 60],
+	]) {
+		const run = await createAutoResume(t, { usage: { rows } });
+		await run.error(noHint);
+		await run.emit("agent_settled");
+		assert.match(run.statuses.get("apple-pi-auto-resume"), /^Auto-resume at [^·]+$/);
+		run.jump(minutes * 60_000);
+		assert.deepEqual(run.prompts, [], `not before ${minutes} + 1 min`);
+		run.jump(60_000);
+		assert.deepEqual(run.prompts, ["continue"], `at ${minutes} + 1 min`);
+	}
+});
+
+test("auto-resume: the error's own hint wins over any window reset", async t => {
+	for (const resetAt of [now + 10 * 60_000, now + 7 * day * 1000]) {
+		const run = await createAutoResume(t, { usage: { rows: [{ label: "5-hour", pct: 100, resetAt }] } });
+		await run.error();
+		await run.emit("agent_settled");
+		run.jump(22 * 60_000);
+		assert.deepEqual(run.prompts, []);
+		run.jump(60_000);
+		assert.deepEqual(run.prompts, ["continue"]);
+	}
 });
 
 test("auto-resume: stale/invalid usage cannot override the error hint", async t => {
@@ -1300,7 +1321,7 @@ test("auto-resume: the full extension wires fresh usage, queued input, footer st
 	assert.ok(!plainText(run.footer).includes("Auto-resume"));
 });
 
-test("auto-resume: OpenAI direct-token errors never use display-only Codex CLI reset times", async t => {
+test("auto-resume: OpenAI Codex CLI quota never postpones the error's own retry hint", async t => {
 	const timers = new Set();
 	const clock = {
 		t: now, now: () => clock.t,
@@ -1316,7 +1337,7 @@ test("auto-resume: OpenAI direct-token errors never use display-only Codex CLI r
 	t.after(() => run.events.get("session_shutdown")({}, run.ctx));
 	await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: "subscription_sharing_usage_limit_exceeded. Try again in ~22 min." } }, run.ctx);
 	await run.events.get("agent_settled")({}, run.ctx);
-	assert.equal(run.requests.length, 1, "Auto-resume does not fetch CLI quota as direct-token reset evidence");
+	assert.equal(run.requests.length, 2, "Auto-resume reads fresh CLI quota");
 	assert.equal(timers.size, 1);
 	const fire = () => { const timer = [...timers][0]; timers.delete(timer); timer.fn(); };
 	clock.t = now + 23 * 60_000 - 1;
@@ -1325,6 +1346,46 @@ test("auto-resume: OpenAI direct-token errors never use display-only Codex CLI r
 	clock.t++;
 	fire();
 	assert.deepEqual(run.prompts, ["continue"], "CLI weekly exhaustion cannot postpone the actual error hint");
+});
+
+test("auto-resume: without a hint, OpenAI retries at the first Codex CLI window reset", async t => {
+	const sharingError = "The ChatGPT user has reached their Subscription Sharing usage limit.";
+	for (const [usedPercent, fiveHourMinutes, weeklyMinutes, waitMinutes] of [
+		[98, 10, 5 * 24 * 60, 11],
+		// 2026-10-23 22:33: 100% used, reset 3 hours away. Backoff would retry
+		// in 15 minutes and keep failing until well after the reset.
+		[100, 3 * 60, 5 * 24 * 60, 3 * 60 + 1],
+		// Usage level does not matter: the Sharing limit is not the CLI's own.
+		[25, 2 * 60, 5 * 24 * 60, 2 * 60 + 1],
+		// A weekly reset also resets the 5-hour window.
+		[100, 3 * 60, 30, 31],
+	]) {
+		const timers = new Set();
+		const clock = {
+			t: now, now: () => clock.t,
+			setTimeout(fn, delay) { const timer = { fn, delay, unref() {} }; timers.add(timer); return timer; },
+			clearTimeout: timer => timers.delete(timer),
+		};
+		const response = structuredClone(fixtures["openai-codex"].response);
+		response.rate_limit.primary_window = { limit_window_seconds: 5 * hour, used_percent: usedPercent, reset_at: (now + fiveHourMinutes * 60_000) / 1000 };
+		response.rate_limit.secondary_window = { limit_window_seconds: 7 * day, used_percent: 40, reset_at: (now + weeklyMinutes * 60_000) / 1000 };
+		const run = await createFooter("openai", plainTheme, 200, {
+			...openaiOptions(cliAuth), mode: "rpc", clock,
+			responses: { [fixtures["openai-codex"].url]: response },
+		});
+		await run.events.get("message_end")({ message: { role: "assistant", stopReason: "error", errorMessage: sharingError } }, run.ctx);
+		await run.events.get("agent_settled")({}, run.ctx);
+		assert.match(plainText(run.footer), /Auto-resume at [^·]+$/);
+		const start = clock.t;
+		const fire = () => { const timer = [...timers][0]; timers.delete(timer); timer.fn(); };
+		clock.t = start + waitMinutes * 60_000 - 1;
+		fire();
+		assert.deepEqual(run.prompts, [], `5-hour reset in ${fiveHourMinutes} min, weekly in ${weeklyMinutes}: not before ${waitMinutes} min`);
+		clock.t++;
+		fire();
+		assert.deepEqual(run.prompts, ["continue"], `5-hour reset in ${fiveHourMinutes} min, weekly in ${weeklyMinutes}: at ${waitMinutes} min`);
+		await run.events.get("session_shutdown")({}, run.ctx);
+	}
 });
 
 test("auto-resume: a footer refresh still running at settlement is followed by a fresh fetch", async t => {

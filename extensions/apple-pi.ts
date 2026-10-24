@@ -40,7 +40,8 @@
  *   Z.ai    GET https://api.z.ai/api/monitor/usage/quota/limit
  *   Codex   GET https://chatgpt.com/backend-api/wham/usage  (Codex OAuth)
  *   OpenAI  Same quota endpoint, using a separate Codex CLI subscription login.
- *           This is display-only; it cannot establish OpenAI app-specific limits.
+ *           Shown in the footer, and used to time OpenAI auto-resume when the
+ *           limit error gives no retry hint.
  */
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, UserMessageComponent } from "@earendil-works/pi-coding-agent";
@@ -489,14 +490,18 @@ export function installAutoResume(
 		// Shutdown/reload/session replacement can happen during the fetch.
 		if (!current(wait) || wait.deadline !== undefined) return;
 		const hint = usageRetryAt(wait.error, wait.failedAt);
-		// Additional buckets may belong to another model, so do not let them
-		// postpone a main-plan retry. Never schedule from retained stale rows.
+		// Additional buckets may belong to another model, so they never set the
+		// retry. Never schedule from retained stale rows or passed resets.
 		const resets = usage && !usage.stale ? usage.rows
-			.filter(row => !row.bucket && row.pct !== undefined && row.pct >= 100 && row.resetAt !== undefined && Number.isFinite(new Date(row.resetAt).getTime()))
+			.filter(row => !row.bucket && row.resetAt !== undefined && Number.isFinite(new Date(row.resetAt).getTime()) && row.resetAt > Date.now())
 			.map(row => row.resetAt!) : [];
-		const known = [hint, ...resets].filter((stamp): stamp is number => stamp !== undefined);
-		if (known.length) {
-			wait.deadline = Math.max(Date.now(), ...known) + RESUME_BUFFER_MS;
+		// The error's hint names the limit that was hit. Otherwise wait for the
+		// first window reset: a longer window's reset also resets the shorter
+		// ones. Usage levels are not trusted to say which window blocks: OpenAI's
+		// Subscription Sharing limit blocked Pi at 98% (tasks/context.md).
+		const next = hint ?? (resets.length ? Math.min(...resets) : undefined);
+		if (next !== undefined) {
+			wait.deadline = Math.max(Date.now(), next) + RESUME_BUFFER_MS;
 			unknownRetries = 0;
 		} else {
 			// No trustworthy reset information: retry conservatively, backing off
@@ -1038,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 				return { rows: [], note: "no usage endpoint", unavailable: true };
 			}
 			// The new direct token cannot read wham/usage. Read the separate CLI
-			// credential only for display; never refresh it or alter chat auth.
+			// credential only to read quota; never refresh it or alter chat auth.
 			let cli: any;
 			try {
 				const home = process.env.CODEX_HOME || join(homedir(), ".codex");
@@ -1525,8 +1530,7 @@ export default function (pi: ExtensionAPI) {
 	installToolHeaders(pi);
 	installAutoResume(pi, async ctx => {
 		const key = ctx.model ? PROVIDER_KEYS[ctx.model.provider] : undefined;
-		// Codex CLI plan quota says nothing about direct-token app limits.
-		if (!key || key === "openai") return undefined;
+		if (!key) return undefined;
 		// A running fetch (a footer refresh after a turn or a sent message) may have
 		// started before the limit was hit. Let it finish, then fetch again, so
 		// old data is never mistaken for a fresh reset.
