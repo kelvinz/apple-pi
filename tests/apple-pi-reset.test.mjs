@@ -1194,6 +1194,8 @@ test("auto-resume: unknown resets back off automatically, and known new limits c
 	for (const minutes of [15, 30, 60, 60]) {
 		await run.error("You have hit your ChatGPT usage limit. Try again later.");
 		await run.emit("agent_settled");
+		// A backoff retry must not read as a provider-reported reset time.
+		assert.match(run.statuses.get("apple-pi-auto-resume"), /^Auto-resume retry at .+ · reset time unknown$/);
 		const before = run.prompts.length;
 		run.jump((minutes - 1) * 60_000);
 		assert.equal(run.prompts.length, before);
@@ -1202,6 +1204,7 @@ test("auto-resume: unknown resets back off automatically, and known new limits c
 	}
 	await run.error(quotaError);
 	await run.emit("agent_settled");
+	assert.match(run.statuses.get("apple-pi-auto-resume"), /^Auto-resume at [^·]+$/);
 	run.jump(23 * 60_000);
 	assert.equal(run.prompts.length, 5);
 });

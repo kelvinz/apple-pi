@@ -374,6 +374,8 @@ export function installAutoResume(
 		error: string;
 		failedAt: number;
 		deadline?: number;
+		// The deadline is a backoff retry, not a reset time anyone reported.
+		guessed?: boolean;
 		queued: number;
 	};
 	let active = false;
@@ -401,7 +403,8 @@ export function installAutoResume(
 	}
 
 	function show(wait: Wait): void {
-		const when = wait.deadline === undefined ? "checking reset time" : `at ${RESET_DATE.format(wait.deadline)}, ${RESET_TIME.format(wait.deadline)}`;
+		const at = wait.deadline === undefined ? "" : `at ${RESET_DATE.format(wait.deadline)}, ${RESET_TIME.format(wait.deadline)}`;
+		const when = wait.deadline === undefined ? "checking reset time" : wait.guessed ? `retry ${at} · reset time unknown` : at;
 		status(wait.ctx, `Auto-resume ${when}${wait.queued ? ` · ${wait.queued} queued` : ""}`);
 	}
 
@@ -499,6 +502,7 @@ export function installAutoResume(
 			// No trustworthy reset information: retry conservatively, backing off
 			// to one hour rather than inventing an exact reset or looping rapidly.
 			wait.deadline = Date.now() + Math.min(UNKNOWN_RESET_RETRY_MS * 2 ** Math.min(unknownRetries++, 2), 60 * 60_000);
+			wait.guessed = true;
 		}
 		show(wait);
 		timer = setTimeout(() => tick(wait), Math.min(wait.deadline - Date.now(), 60_000));
