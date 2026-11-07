@@ -517,13 +517,15 @@ export function installAutoResume(
 
 // ---------- destructive-command guard ----------
 
-// Pi runs every tool call without asking. This asks before shell commands that
-// delete files or discard work. It reads the command text, so a script that
+// Pi runs every tool call without asking. This asks only before shell commands
+// that can lose work for good: deleted files, uncommitted changes, remote work.
+// Commands that can be undone (rmdir, git tag -d, git push --force-with-lease,
+// sudo by itself) run unasked. It reads the command text, so a script that
 // deletes (`npm run clean`) still runs unasked: it is a guard, not a sandbox.
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
-const ALWAYS_ASK = new Set(["rm", "rmdir", "unlink", "shred", "srm", "truncate", "dd", "sudo", "doas", "fdisk", "remove-item", "ri", "del", "erase", "rd"]);
+const ALWAYS_ASK = new Set(["rm", "unlink", "shred", "srm", "truncate", "remove-item", "ri", "del", "erase", "rd"]);
 // Words and shell keywords that run the rest of the line as a command.
-const WRAPPERS = new Set(["env", "command", "exec", "nohup", "time", "nice", "builtin", "watch", "if", "then", "else", "elif", "while", "until", "do", "!", "(", "{"]);
+const WRAPPERS = new Set(["env", "command", "exec", "nohup", "time", "nice", "builtin", "watch", "sudo", "doas", "if", "then", "else", "elif", "while", "until", "do", "!", "(", "{"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish"]);
 const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
 const SQL_DROP = /\b(drop\s+(table|database|schema)|truncate\s+table)\b/i;
@@ -535,25 +537,32 @@ function gitReason(args: string[]): string | undefined {
 	let i = 0;
 	while (i < args.length && args[i].startsWith("-")) i += GIT_VALUE_OPTIONS.has(args[i]) ? 2 : 1;
 	const [sub, ...rest] = args.slice(i);
-	const has = (...flags: string[]) => rest.some(arg => flags.includes(arg));
+	// Short options can be joined: `-f` also matches `-rf`.
+	const has = (...flags: string[]) => rest.some(arg => flags.includes(arg)
+		|| (/^-[a-zA-Z]{2,}$/.test(arg) && flags.some(flag => /^-[a-zA-Z]$/.test(flag) && arg.includes(flag[1]))));
 	switch (sub) {
 		case "clean": return has("-n", "--dry-run") ? undefined : "Deletes files that Git does not track. You cannot get them back.";
-		case "reset": return has("--hard", "--merge", "--keep") ? "Throws away every edit that you have not committed. You cannot get them back." : undefined;
+		// --keep stops instead of overwriting uncommitted changes. --merge keeps
+		// unstaged changes but replaces staged ones.
+		case "reset": return has("--hard") ? "Throws away every edit that you have not committed. You cannot get them back."
+			: has("--merge") ? "Throws away edits that you staged but did not commit. You cannot get them back." : undefined;
 		case "checkout": return has("--", ".", "-f", "--force") ? LOST_CHANGES : undefined;
 		case "restore": return has("--staged", "-S") && !has("--worktree", "-W") ? undefined : LOST_CHANGES;
 		case "switch": return has("--discard-changes", "-f", "--force") ? "Switches branch and throws away edits that you have not committed. You cannot get them back." : undefined;
 		case "stash": return has("drop", "clear") ? "Deletes edits that you stashed. They are very hard to get back." : undefined;
 		case "branch": return has("-D") || (has("-d", "--delete") && has("-f", "--force")) ? "Deletes a branch, even if its commits are on no other branch. Those commits can be lost." : undefined;
-		case "tag": return has("-d", "--delete") ? "Deletes a tag. The commit it points to stays." : undefined;
+		// --force-with-lease only replaces commits you have already fetched, so you still have them.
 		case "push": return has("--mirror", "--prune")
 			? "Makes the remote match your copy. Branches that exist only on the remote can be deleted."
 			: has("--delete", "-d") || rest.some(arg => arg.startsWith(":"))
 			? "Deletes branches or tags from the remote. Work that exists only there is lost."
-			: has("--force", "-f", "--force-with-lease") || rest.some(arg => arg.startsWith("+"))
+			: has("--force", "-f") || rest.some(arg => arg.startsWith("+"))
 			? "Replaces the branch on the remote with yours. Commits that other people pushed can be lost."
 			: undefined;
-		case "rm": return has("--cached") ? undefined : "Deletes files from your folder and from the next commit.";
-		case "worktree": return has("remove", "prune") ? "Deletes a worktree folder or Git's record of it. Files in it that Git does not track, such as .env, can be lost." : undefined;
+		// Without --force, git rm refuses to delete files with uncommitted changes.
+		case "rm": return has("--cached") || !has("-f", "--force") ? undefined : "Deletes files, including edits that you have not committed. You cannot get those edits back.";
+		// Ignored files such as .env go with the folder, even without --force.
+		case "worktree": return has("remove") ? "Deletes a worktree folder. Files in it that Git does not track, such as .env, are lost." : undefined;
 		case "reflog": return has("expire", "delete") ? "Deletes Git's record of where your branches have been. You then cannot use it to get lost commits back." : undefined;
 		case "gc": return rest.some(arg => arg.startsWith("--prune")) ? "Deletes commits that no branch uses. You cannot get them back." : undefined;
 		case "update-ref": return has("-d") ? "Deletes a Git ref. Commits that only it points to can be lost." : undefined;
@@ -568,6 +577,8 @@ const WRAPPER_VALUE_OPTIONS: Record<string, Set<string>> = {
 	watch: new Set(["-n", "--interval"]),
 	timeout: new Set(["-s", "--signal", "-k", "--kill-after"]),
 	time: new Set(["-f", "--format", "-o", "--output"]),
+	sudo: new Set(["-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-p", "--prompt", "-r", "--role", "-t", "--type", "-U", "--other-user", "-T", "--command-timeout"]),
+	doas: new Set(["-u", "-C"]),
 };
 
 function segmentReason(words: string[]): string | undefined {
@@ -599,19 +610,21 @@ function segmentReason(words: string[]): string | undefined {
 	}
 	// xargs options can take values, so any later word may be the program it runs.
 	if (program === "xargs") return args.map((_, n) => segmentReason(args.slice(n))).find(Boolean);
-	if (ALWAYS_ASK.has(program)) {
-		if (program === "sudo" || program === "doas") return "Runs with administrator rights. It can change protected files or settings.";
-		if (program === "dd") return "Writes over a file or a whole disk. The data that was there is lost for good.";
-		if (program === "fdisk") return LOST_DISK;
-		if (program === "truncate") return "Cuts a file down in size. The removed part is lost for good.";
-		return LOST_FILES;
-	}
+	// rmdir removes only empty folders, but PowerShell's rmdir is Remove-Item, and
+	// cmd's `rmdir /s` deletes a whole folder.
+	if (program === "rmdir" && args.some(arg => /^(-r|\/s$)/i.test(arg))) return LOST_FILES;
+	if (ALWAYS_ASK.has(program)) return program === "truncate" ? "Cuts a file down in size. The removed part is lost for good." : LOST_FILES;
+	// Without of=, dd only reads.
+	if (program === "dd" && args.some(arg => arg.startsWith("of="))) return "Writes over a file or a whole disk. The data that was there is lost for good.";
+	if (program === "fdisk" && !args.some(arg => arg === "-l" || arg === "--list")) return LOST_DISK;
 	if (program.startsWith("mkfs")) return LOST_DISK;
 	if (program === "diskutil" && args.some(arg => /^(erase|zero|reformat|partition|secureerase)/i.test(arg))) return LOST_DISK;
 	if (program === "find" && (args.includes("-delete") || args.some((arg, n) => /^-(exec|execdir|ok|okdir)$/.test(arg) && segmentReason(args.slice(n + 1))))) return "Finds files and deletes them. They do not go to the Trash, so you cannot get them back.";
-	if (program === "rsync" && args.some(arg => arg.startsWith("--delete") || arg === "--remove-source-files")) return "Copies files, then deletes files in the source or the target folder.";
+	// --remove-source-files deletes only what it has copied, so nothing is lost.
+	if (program === "rsync" && args.some(arg => arg.startsWith("--delete"))) return "Copies files, then deletes files in the target folder that are not in the source folder. You cannot get those back.";
 	if (program === "git") return gitReason(args);
-	if (program === "docker" && args.some(arg => ["rm", "rmi", "prune"].includes(arg))) return "Deletes Docker containers, images, or their stored data. That data can be lost for good.";
+	// Images can be pulled or built again; containers and volumes hold data that cannot.
+	if (program === "docker" && !args.some(arg => arg === "rmi" || arg === "image") && args.some(arg => arg === "rm" || arg === "prune")) return "Deletes Docker containers or their stored data. That data is lost for good.";
 	if (program === "kubectl" && args.includes("delete")) return "Deletes parts of an app that runs on a Kubernetes cluster. The app can stop, and its data can be lost.";
 	if (program === "terraform" && args.includes("destroy")) return "Deletes the servers and other online services that Terraform set up. Their data can be lost.";
 	return undefined;

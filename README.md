@@ -10,7 +10,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 - A **previous message** button above the fullscreen editor.
 - Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks. In Herdr, selected text goes to the clipboard of the computer viewing the chat, including remote chats. No setting is needed.
 - Automatic continuation after a subscription usage limit resets, with messages added while waiting included on resume. No settings or enable command.
-- A permission question before shell commands that delete files or discard work, such as `rm`, `git reset --hard`, or `git push --force`. See [Destructive commands](#destructive-commands).
+- A permission question before shell commands that can lose work for good, such as `rm`, `git reset --hard`, or `git push --force`. See [Destructive commands](#destructive-commands).
 
 Reset times use the computer's local time zone and a 24-hour clock:
 
@@ -120,13 +120,15 @@ Pi must stay running, and the timer waits for Pi to be idle and for extension ap
 
 ## Destructive commands
 
-Pi runs tool calls without asking. apple-pi asks you first when a `bash` or `powershell` command could delete files or discard work:
+Pi runs tool calls without asking. apple-pi asks you first only when a `bash` or `powershell` command can lose work that you cannot get back:
 
-- file deletion: `rm`, `rmdir`, `unlink`, `shred`, `srm`, `truncate`, `dd`, `find -delete`, `find -exec rm`, `rsync --delete`, `Remove-Item`, `ri`, `del`, `erase`, `rd`;
-- Git: `clean`, `reset --hard`, `checkout -- <path>` or `checkout .`, `restore` (except `--staged` only), `switch -f`, `stash drop` or `clear`, `branch -D`, `tag -d`, force or deleting pushes, `rm` (except `--cached`), `worktree remove`, `reflog expire`, `gc --prune`, `update-ref -d`, and history rewrites;
-- disks and services: `sudo`, `doas`, `fdisk`, `mkfs`, `diskutil erase…`, `docker rm`, `rmi`, or `prune`, `kubectl delete`, `terraform destroy`, and SQL `DROP TABLE`, `DROP DATABASE`, or `TRUNCATE TABLE`.
+- file deletion: `rm`, `rmdir -Recurse` or `rmdir /s`, `unlink`, `shred`, `srm`, `truncate`, `dd of=…`, `find -delete`, `find -exec rm`, `rsync --delete`, `Remove-Item`, `ri`, `del`, `erase`, `rd`;
+- Git: `clean`, `reset --hard` or `--merge`, `checkout -- <path>` or `checkout .`, `restore` (except `--staged` only), `switch -f`, `stash drop` or `clear`, `branch -D`, `push --force` (also when joined, as in `-fu`), `+<branch>`, `--delete`, `--mirror`, or `--prune`, `rm -f`, `worktree remove`, `reflog expire`, `gc --prune`, `update-ref -d`, and history rewrites;
+- disks and services: `fdisk` (except `-l`), `mkfs`, `diskutil erase…`, `docker rm` or `prune` (except images), `kubectl delete`, `terraform destroy`, and SQL `DROP TABLE`, `DROP DATABASE`, or `TRUNCATE TABLE`.
 
-The check also looks inside `bash -c`, `eval`, `xargs`, `$( … )`, subshells, and chained commands. It checks commands after wrappers such as `timeout`, `nice`, `env`, and `watch`, including their common options. Codemode scripts call tools through the same check.
+Commands that change things you can easily restore run without a question: `rmdir` without `-Recurse` or `/s` (only empty folders), `git tag -d`, `git push --force-with-lease`, `git reset --keep`, `git rm` without `-f` (Git refuses to delete uncommitted changes), `git worktree prune`, `rsync --remove-source-files`, `docker rmi`, and `docker image …`. `sudo` and `doas` do not ask by themselves; the guard checks the command they run, so `sudo rm -rf /opt/x` still asks.
+
+The check also looks inside `bash -c`, `eval`, `xargs`, `$( … )`, subshells, and chained commands. It checks commands after wrappers such as `sudo`, `timeout`, `nice`, `env`, and `watch`, including their common options. Codemode scripts call tools through the same check.
 
 Before the question opens, your current model explains what the **whole command will do**, in plain words, like one person talking to another. It assumes you know Git ideas such as commits and branches, but not what each command or option does. The request asks for 2 or 3 sentences of at most 20 words in ASD-STE100 Simplified Technical English, in one paragraph, without notes in brackets or words such as "pipe" or "reflog". It first says what the command does, step by step, and then what is lost for good. The guard sends its own reason for asking (for example, "Throws away every edit that you have not committed") with the command, so the explanation can name the specific risk. For example, `cd app && rm -rf dist && npm run build` should explain going into `app`, deleting `dist` and all its files for good, and then building the app. Only commands that the guard flags get an explanation. The prompt shows the explanation without a label, then the original command, and offers **Yes**, **No**, and **Type a reply**, without extra help text about these choices. A typed reply stops the command and sends your instructions back to the agent. Closing either question or submitting an empty reply also stops the command. Print and JSON runs cannot ask, so they block these commands. Questions are asked one at a time: concurrent flagged commands (including several from one codemode script) queue, so one question can never displace another unresolved one. Cancelling a queued command blocks it without a question, and closing the session blocks everything still waiting. While the question is open, apple-pi sends a `herdr:blocked` event. The tests check this event, but the live Herdr pane display has not been verified.
 

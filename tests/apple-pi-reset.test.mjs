@@ -1419,7 +1419,7 @@ test("auto-resume: only long-lived TUI and RPC sessions schedule continuations",
 test("guard: commands that delete files or discard work ask first", () => {
 	const { destructiveReason } = loadExtension();
 	for (const command of [
-		"rm build.log", "rm -rf dist", "/bin/rm -f x", "sudo ls", "rmdir old", "unlink x", "truncate -s 0 log", "dd if=/dev/zero of=disk",
+		"rm build.log", "rm -rf dist", "/bin/rm -f x", "sudo rm -rf /opt/x", "sudo -u bob rm x", "doas rm x", "unlink x", "truncate -s 0 log", "dd if=/dev/zero of=disk",
 		"cd src && rm -rf node_modules", "npm test; rm out.txt", "echo $(rm x)", "(rm -rf x)", "if true; then rm x; fi",
 		"timeout 5 rm x", "timeout 30 rm -rf build", "timeout -s TERM 30 rm -rf build", "env -S \"rm x\"", "nice -n 10 env -u FOO rm x", "nice -n 10 rm x", "env -u FOO rm x", "watch -n 5 rm x", "env -- rm x", "nice --adjustment=10 rm x",
 		"FOO=1 env -i nohup rm x", "bash -c 'cd /tmp && rm -rf y'", "sh -lc \"rm x\"", "eval \"rm x\"",
@@ -1427,11 +1427,13 @@ test("guard: commands that delete files or discard work ask first", () => {
 		"rsync -a --delete src/ dst/", "mkfs.ext4 /dev/sdb1", "diskutil eraseDisk APFS X disk4",
 		"git clean -fdx", "git reset --hard HEAD~1", "git checkout -- src/app.ts", "git checkout .", "git restore src/app.ts",
 		"git switch -f main", "git stash drop", "git stash clear", "git branch -D feature", "git branch -d -f feature",
-		"git tag -d v1", "git push --force origin main", "git push -f", "git push origin --delete old", "git push origin :old",
-		"git push origin +main", "git rm src/a.ts", "git worktree remove ../wt", "git reflog expire --all", "git gc --prune=now",
+		"git push --force origin main", "git push -f", "git push origin --delete old", "git push origin :old",
+		"git push origin +main", "git rm -f src/a.ts", "git worktree remove ../wt", "git reflog expire --all", "git gc --prune=now",
 		"git -C ../repo reset --hard", "git update-ref -d refs/heads/x", "git filter-branch --tree-filter x",
 		"docker rm -f web", "docker system prune -a", "kubectl delete pod x", "terraform destroy", "psql -c 'DROP TABLE users'",
-		"Remove-Item -Recurse build",
+		"Remove-Item -Recurse build", "fdisk /dev/sdb",
+		// Short options joined together, and PowerShell's rmdir (an alias of Remove-Item).
+		"git rm -rf src", "git push -fu origin main", "git branch -df feature", "git reset --merge HEAD~1", "rmdir -Recurse build", "rmdir /s build",
 	]) assert.ok(destructiveReason(command), command);
 });
 
@@ -1445,7 +1447,7 @@ test("guard: explanations name simple targets without guessing shell expansions"
 	assert.equal(destructiveReason('rm "$OUTPUT"'), "Deletes files or folders. They do not go to the Trash, so you cannot get them back.");
 });
 
-test("guard: ordinary commands, read-only git, and words inside arguments run unasked", () => {
+test("guard: ordinary commands, recoverable changes, and words inside arguments run unasked", () => {
 	const { destructiveReason } = loadExtension();
 	for (const command of [
 		"timeout 30 npm test", "nice -n 10 npm test", "env -u FOO npm test", "watch -n 2 ls",
@@ -1454,6 +1456,10 @@ test("guard: ordinary commands, read-only git, and words inside arguments run un
 		"git push -u origin feature", "git rm --cached secrets.env", "git clean -n", "git stash", "git commit -m 'remove the old rm helper'",
 		"find . -name '*.ts'", "rsync -a src/ dst/", "docker ps", "kubectl get pods", "echo remove", "cat format.txt",
 		"mv a b", "node scripts/drop-cache.js", "cmd 2>&1 | tee out.log",
+		// These change things, but the change can be undone.
+		"sudo ls", "sudo -u bob apt install jq", "rmdir old", "git tag -d v1", "git rm src/a.ts", "git worktree prune",
+		"git push --force-with-lease origin main", "git reset --keep HEAD~1", "git clean -nd", "rmdir -p a/b/c", "rsync -a --remove-source-files src/ dst/",
+		"docker rmi web", "docker image prune -a", "docker image rm web", "dd if=/dev/disk0 bs=512 count=1", "fdisk -l",
 	]) assert.equal(destructiveReason(command), undefined, command);
 });
 
