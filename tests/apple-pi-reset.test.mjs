@@ -1437,11 +1437,12 @@ test("guard: commands that delete files or discard work ask first", () => {
 
 test("guard: explanations name simple targets without guessing shell expansions", () => {
 	const { destructiveReason } = loadExtension();
-	assert.equal(destructiveReason("rm build.log"), "Deletes build.log.");
-	assert.equal(destructiveReason("rm -rf dist"), "Deletes dist and everything inside it.");
-	assert.equal(destructiveReason("git reset --hard"), "Resets your files to a saved version in Git. Changes that you have not saved can be lost.");
-	assert.equal(destructiveReason("git push origin --delete old"), "Deletes the named branches or tags from the remote server. Other people can lose access to that work.");
-	assert.equal(destructiveReason('rm "$OUTPUT"'), "This command can delete files or folders. You can lose their contents.");
+	assert.equal(destructiveReason("rm build.log"), "Deletes build.log. You cannot get it back.");
+	assert.equal(destructiveReason("rm -rf dist out"), "Deletes dist, out and everything inside them. You cannot get them back.");
+	assert.equal(destructiveReason("git reset --hard"), "Throws away every edit that you have not committed. You cannot get them back.");
+	assert.equal(destructiveReason("git push origin --delete old"), "Deletes branches or tags from the remote. Work that exists only there is lost.");
+	assert.equal(destructiveReason("git push --force-with-lease -f"), "Replaces the branch on the remote with yours. Commits that other people pushed can be lost.");
+	assert.equal(destructiveReason('rm "$OUTPUT"'), "Deletes files or folders. They do not go to the Trash, so you cannot get them back.");
 });
 
 test("guard: ordinary commands, read-only git, and words inside arguments run unasked", () => {
@@ -1545,11 +1546,14 @@ test("guard: summarises the whole command with the current model and no tools", 
 	assert.equal(run.summaries.length, 1);
 	const request = run.summaries[0];
 	assert.equal(request.selected.id, "test-model");
-	assert.deepEqual(asPlain(JSON.parse(request.context.messages[0].content)), { shell: "bash", command });
+	assert.deepEqual(asPlain(JSON.parse(request.context.messages[0].content)), { shell: "bash", command, risk: "Deletes files or folders. They do not go to the Trash, so you cannot get them back." });
 	assert.equal(request.context.messages.length, 1);
 	assert.equal(request.context.tools, undefined);
 	assert.match(request.context.systemPrompt, /entire command/);
 	assert.match(request.context.systemPrompt, /untrusted data/);
+	assert.match(request.context.systemPrompt, /ASD-STE100/);
+	assert.match(request.context.systemPrompt, /know Git/);
+	assert.match(request.context.systemPrompt, /lost for good/);
 	assert.ok(request.options.maxTokens <= 1024);
 });
 
@@ -1561,7 +1565,7 @@ test("guard: failed or incomplete summaries do not become approval or a misleadi
 	]) {
 		const run = guardRun({ ...options, answer: "No" });
 		assert.equal((await run.call("bash", { command: "rm x" })).block, true);
-		assert.equal(run.asked[0][0], "Allow this command?\n\nSummary unavailable. Read the full command before you decide.\n\nCommand:\nrm x");
+		assert.equal(run.asked[0][0], "Allow this command?\n\nDeletes x. You cannot get it back.\n\nNo summary of the full command is available. Read it before you decide.\n\nCommand:\nrm x");
 	}
 });
 
@@ -1577,7 +1581,7 @@ test("guard: a summary timeout aborts the request even when the provider never r
 	assert.equal((await call).block, true);
 	assert.equal(run.summaries[0].options.signal.aborted, true);
 	assert.equal(cleared, true);
-	assert.match(run.asked[0][0], /Summary unavailable/);
+	assert.match(run.asked[0][0], /No summary of the full command is available/);
 });
 
 test("guard: cancelling during a summary stops the command without opening a question", async () => {
@@ -1629,7 +1633,7 @@ test("guard: a declined command is blocked and tells the model to ask the user",
 	const run = guardRun({ answer: "No" });
 	const result = await run.call("bash", { command: "git reset --hard" });
 	assert.equal(result.block, true);
-	assert.match(result.reason, /Command stopped\. Resets your files to a saved version in Git\..*Ask the user/);
+	assert.match(result.reason, /Command stopped\. Throws away every edit that you have not committed\..*Ask the user/);
 	assert.deepEqual(asPlain(run.signals.at(-1)), ["herdr:blocked", { active: false }]);
 });
 

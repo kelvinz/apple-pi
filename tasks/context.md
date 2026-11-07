@@ -2,7 +2,7 @@
 
 ## Project
 - Personal Pi UI/workflow extension loaded directly from `extensions/apple-pi.ts`; no build step.
-- Verification recipe: run `pnpm test` with globally installed Pi (or `PI_PACKAGE_DIR`). Tests mock credentials/HTTP. For the live footer, run `/reload` then `/usage` in Pi; confirm the source label and compare quota with the corresponding account's usage page. No background service is started.
+- Verification recipe: run `pnpm test` with globally installed Pi (or `PI_PACKAGE_DIR`). Tests mock credentials/HTTP. For the live footer, run `/reload` then `/usage` in Pi; confirm the source label and compare quota with the corresponding account's usage page. For the permission question without a terminal, run `pi --mode rpc --no-session --tools bash` in a scratch folder, prompt it to run a flagged command, read the `extension_ui_request` select `title` (the exact question text), and answer `No`. The model can refuse disk or infrastructure commands before the guard runs; for those, a scratch extension loaded with `-e` can pass the text to `installDestructiveGuard`'s `tool_call` handler from a slash command, which asks without running anything. No background service is started.
 
 ## Current state
 - OpenAI subscription quota support is implemented; no PRD was created for this user-requested change.
