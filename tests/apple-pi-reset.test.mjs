@@ -1416,7 +1416,7 @@ test("auto-resume: only long-lived TUI and RPC sessions schedule continuations",
 	}
 });
 
-test("guard: commands that delete files or discard work ask first", () => {
+test("guard: commands that delete files, discard work, or push ask first", () => {
 	const { destructiveReason } = loadExtension();
 	for (const command of [
 		"rm build.log", "rm -rf dist", "/bin/rm -f x", "sudo rm -rf /opt/x", "sudo -u bob rm x", "doas rm x", "unlink x", "truncate -s 0 log", "dd if=/dev/zero of=disk",
@@ -1427,6 +1427,8 @@ test("guard: commands that delete files or discard work ask first", () => {
 		"rsync -a --delete src/ dst/", "mkfs.ext4 /dev/sdb1", "diskutil eraseDisk APFS X disk4",
 		"git clean -fdx", "git reset --hard HEAD~1", "git checkout -- src/app.ts", "git checkout .", "git restore src/app.ts",
 		"git switch -f main", "git stash drop", "git stash clear", "git branch -D feature", "git branch -d -f feature",
+		"git push", "git push origin main", "git push -u origin feature", "git push --force-with-lease origin main",
+		"git -C ../repo push origin main", "(cd repo && git push)", "find . -exec git push \;",
 		"git push --force origin main", "git push -f", "git push origin --delete old", "git push origin :old",
 		"git push origin +main", "git rm -f src/a.ts", "git worktree remove ../wt", "git reflog expire --all", "git gc --prune=now",
 		"git -C ../repo reset --hard", "git update-ref -d refs/heads/x", "git filter-branch --tree-filter x",
@@ -1445,6 +1447,9 @@ test("guard: explanations name simple targets without guessing shell expansions"
 	assert.equal(destructiveReason("git push origin --delete old"), "Deletes branches or tags from the remote. Work that exists only there is lost.");
 	assert.equal(destructiveReason("git push --force-with-lease -f"), "Replaces the branch on the remote with yours. Commits that other people pushed can be lost.");
 	assert.equal(destructiveReason('rm "$OUTPUT"'), "Deletes files or folders. They do not go to the Trash, so you cannot get them back.");
+	assert.equal(destructiveReason("git push"), "Sends your commits to the remote copy of the project. Once other people have them, taking them back is hard.");
+	assert.equal(destructiveReason("git push origin main"), "Sends your commits to the remote copy of the project. Once other people have them, taking them back is hard.");
+	assert.equal(destructiveReason("find . -exec git push \;"), "Sends your commits to the remote copy of the project. Once other people have them, taking them back is hard.");
 });
 
 test("guard: ordinary commands, recoverable changes, and words inside arguments run unasked", () => {
@@ -1452,13 +1457,13 @@ test("guard: ordinary commands, recoverable changes, and words inside arguments 
 	for (const command of [
 		"timeout 30 npm test", "nice -n 10 npm test", "env -u FOO npm test", "watch -n 2 ls",
 		"ls -la", "npm test", "grep -rn rm src", "git status", "git log --oneline", "git diff", "git checkout main",
-		"git checkout -b feature", "git switch main", "git restore --staged src/a.ts", "git branch -d merged", "git push",
-		"git push -u origin feature", "git rm --cached secrets.env", "git clean -n", "git stash", "git commit -m 'remove the old rm helper'",
+		"git checkout -b feature", "git switch main", "git restore --staged src/a.ts", "git branch -d merged", "git push --dry-run", "git push -n",
+		"git rm --cached secrets.env", "git clean -n", "git stash", "git commit -m 'remove the old rm helper'",
 		"find . -name '*.ts'", "rsync -a src/ dst/", "docker ps", "kubectl get pods", "echo remove", "cat format.txt",
 		"mv a b", "node scripts/drop-cache.js", "cmd 2>&1 | tee out.log",
 		// These change things, but the change can be undone.
 		"sudo ls", "sudo -u bob apt install jq", "rmdir old", "git tag -d v1", "git rm src/a.ts", "git worktree prune",
-		"git push --force-with-lease origin main", "git reset --keep HEAD~1", "git clean -nd", "rmdir -p a/b/c", "rsync -a --remove-source-files src/ dst/",
+		"git reset --keep HEAD~1", "git clean -nd", "rmdir -p a/b/c", "rsync -a --remove-source-files src/ dst/",
 		"docker rmi web", "docker image prune -a", "docker image rm web", "dd if=/dev/disk0 bs=512 count=1", "fdisk -l",
 	]) assert.equal(destructiveReason(command), undefined, command);
 });

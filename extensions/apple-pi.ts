@@ -26,9 +26,9 @@
  * 7. Usage-limit errors automatically resume after reset + one minute.
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
- * 8. Shell commands that delete files or discard work ask first, one question
- *    at a time. Print and JSON runs block them. A blocked-state event is sent
- *    to Herdr meanwhile.
+ * 8. Shell commands that delete files, discard work, or push to a remote ask
+ *    first, one question at a time. Print and JSON runs block them. A
+ *    blocked-state event is sent to Herdr meanwhile.
  *
  * Plan data refreshes when you send a message, after each turn, when the
  * agent settles, when you change model, and on /usage, but not more than
@@ -517,11 +517,12 @@ export function installAutoResume(
 
 // ---------- destructive-command guard ----------
 
-// Pi runs every tool call without asking. This asks only before shell commands
-// that can lose work for good: deleted files, uncommitted changes, remote work.
-// Commands that can be undone (rmdir, git tag -d, git push --force-with-lease,
-// sudo by itself) run unasked. It reads the command text, so a script that
-// deletes (`npm run clean`) still runs unasked: it is a guard, not a sandbox.
+// Pi runs every tool call without asking. This asks before shell commands that
+// can lose work for good or reach past this folder: deleted files, discarded
+// edits, and pushes to a remote. Commands that change nothing or can be undone
+// (git push --dry-run, rmdir, git tag -d, sudo by itself) run unasked. It reads
+// the command text, so a script that deletes (`npm run clean`) still runs
+// unasked: it is a guard, not a sandbox.
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
 const ALWAYS_ASK = new Set(["rm", "unlink", "shred", "srm", "truncate", "remove-item", "ri", "del", "erase", "rd"]);
 // Words and shell keywords that run the rest of the line as a command.
@@ -551,14 +552,15 @@ function gitReason(args: string[]): string | undefined {
 		case "switch": return has("--discard-changes", "-f", "--force") ? "Switches branch and throws away edits that you have not committed. You cannot get them back." : undefined;
 		case "stash": return has("drop", "clear") ? "Deletes edits that you stashed. They are very hard to get back." : undefined;
 		case "branch": return has("-D") || (has("-d", "--delete") && has("-f", "--force")) ? "Deletes a branch, even if its commits are on no other branch. Those commits can be lost." : undefined;
-		// --force-with-lease only replaces commits you have already fetched, so you still have them.
-		case "push": return has("--mirror", "--prune")
+		// Every push except a dry run sends work to the shared remote, so it asks
+		// first. The first three variants can also lose work that is already there.
+		case "push": return has("--dry-run", "-n") ? undefined : has("--mirror", "--prune")
 			? "Makes the remote match your copy. Branches that exist only on the remote can be deleted."
 			: has("--delete", "-d") || rest.some(arg => arg.startsWith(":"))
 			? "Deletes branches or tags from the remote. Work that exists only there is lost."
 			: has("--force", "-f") || rest.some(arg => arg.startsWith("+"))
 			? "Replaces the branch on the remote with yours. Commits that other people pushed can be lost."
-			: undefined;
+			: "Sends your commits to the remote copy of the project. Once other people have them, taking them back is hard.";
 		// Without --force, git rm refuses to delete files with uncommitted changes.
 		case "rm": return has("--cached") || !has("-f", "--force") ? undefined : "Deletes files, including edits that you have not committed. You cannot get those edits back.";
 		// Ignored files such as .env go with the folder, even without --force.
@@ -620,7 +622,17 @@ function segmentReason(words: string[]): string | undefined {
 	if (program === "fdisk" && !args.some(arg => arg === "-l" || arg === "--list")) return LOST_DISK;
 	if (program.startsWith("mkfs")) return LOST_DISK;
 	if (program === "diskutil" && args.some(arg => /^(erase|zero|reformat|partition|secureerase)/i.test(arg))) return LOST_DISK;
-	if (program === "find" && (args.includes("-delete") || args.some((arg, n) => /^-(exec|execdir|ok|okdir)$/.test(arg) && segmentReason(args.slice(n + 1))))) return "Finds files and deletes them. They do not go to the Trash, so you cannot get them back.";
+	if (program === "find") {
+		// The command find runs is what can lose work, so use its own reason; a
+		// push inside -exec must not be described as deleting files.
+		for (let n = 0; n < args.length; n++) {
+			if (!/^-(exec|execdir|ok|okdir)$/.test(args[n])) continue;
+			const execReason = segmentReason(args.slice(n + 1));
+			if (execReason) return execReason;
+		}
+		if (args.includes("-delete")) return "Finds files and deletes them. They do not go to the Trash, so you cannot get them back.";
+		return undefined;
+	}
 	// --remove-source-files deletes only what it has copied, so nothing is lost.
 	if (program === "rsync" && args.some(arg => arg.startsWith("--delete"))) return "Copies files, then deletes files in the target folder that are not in the source folder. You cannot get those back.";
 	if (program === "git") return gitReason(args);
@@ -658,7 +670,7 @@ const COMMAND_SUMMARY_PROMPT = `A person must decide if a command can run on the
 
 Write 2 or 3 short sentences in one paragraph, like one person talking to another. Use ASD-STE100 Simplified Technical English: common words, active voice, one idea in each sentence, and no more than 20 words in a sentence.
 1. Say what the command does, step by step, in the order it runs. Name the files, folders, branches, or services that it changes.
-2. Say what is lost for good. The "risk" field says why this command needs permission. Always include that risk, made specific to this command.
+2. Say what it changes outside the project folder and what is lost for good. Leave out a part that does not apply. The "risk" field says why this command needs permission. Always include that risk, made specific to this command.
 3. If something is unknown, such as what a script does or what a variable holds, say so. Do not guess.
 
 Describe what each part does instead of naming the command or its options. Leave out details that do not change what is lost, such as block sizes. If the command does not use Git, do not mention Git at all. Say only what the command shows; do not warn about other problems. Do not add explanations in brackets, and do not explain what Git or other tools are. Do not use words such as pipe, redirect, flag, glob, subshell, stdout, recursive, reflog, or HEAD. Do not quote command options. Do not name a service, such as GitHub, unless the command names it. Do not say what stays safe. Do not explain ways to recover lost work.
