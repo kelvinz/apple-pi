@@ -585,7 +585,8 @@ function segmentReason(words: string[]): string | undefined {
 	let i = 0;
 	while (i < words.length) {
 		if (/^\w+=/.test(words[i])) { i++; continue; }
-		const wrapper = words[i].split("/").pop()!;
+		// `(sudo rm x)` leaves a bracket on the wrapper word.
+		const wrapper = words[i].replace(/^[({]+(?=.)/, "").split("/").pop()!;
 		if (!WRAPPERS.has(wrapper) && wrapper !== "timeout") break;
 		i++;
 		while (i < words.length && words[i].startsWith("-")) {
@@ -644,9 +645,10 @@ export function destructiveReason(command: string): string | undefined {
 	if (SQL_DROP.test(command)) return "Deletes a database table or all its data. You cannot get it back without a backup.";
 	// Quotes are dropped and every separator splits, even inside quotes: a quoted
 	// `rm` may then ask once more than needed, but `bash -c "x; rm y"` cannot hide.
+	// A closing bracket is dropped too, so `(cd repo && git reset --hard)` reads `--hard`.
 	const segments = command.replace(/\\\n/g, " ").replace(/["']/g, " ").split(/;|&&|\|\||\||&|\n|\$\(|`/);
 	for (const segment of segments) {
-		const reason = segmentReason(segment.trim().split(/\s+/).filter(Boolean));
+		const reason = segmentReason(segment.trim().split(/\s+/).map(word => word.replace(/\)+$/, "")).filter(Boolean));
 		if (reason) return reason;
 	}
 	return undefined;

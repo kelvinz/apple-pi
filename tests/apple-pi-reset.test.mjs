@@ -1420,7 +1420,7 @@ test("guard: commands that delete files or discard work ask first", () => {
 	const { destructiveReason } = loadExtension();
 	for (const command of [
 		"rm build.log", "rm -rf dist", "/bin/rm -f x", "sudo rm -rf /opt/x", "sudo -u bob rm x", "doas rm x", "unlink x", "truncate -s 0 log", "dd if=/dev/zero of=disk",
-		"cd src && rm -rf node_modules", "npm test; rm out.txt", "echo $(rm x)", "(rm -rf x)", "if true; then rm x; fi",
+		"cd src && rm -rf node_modules", "npm test; rm out.txt", "echo $(rm x)", "(rm -rf x)", "(cd repo && git reset --hard)", "(sudo rm -rf /opt/x)", "if true; then rm x; fi",
 		"timeout 5 rm x", "timeout 30 rm -rf build", "timeout -s TERM 30 rm -rf build", "env -S \"rm x\"", "nice -n 10 env -u FOO rm x", "nice -n 10 rm x", "env -u FOO rm x", "watch -n 5 rm x", "env -- rm x", "nice --adjustment=10 rm x",
 		"FOO=1 env -i nohup rm x", "bash -c 'cd /tmp && rm -rf y'", "sh -lc \"rm x\"", "eval \"rm x\"",
 		"find . -name '*.tmp' -delete", "find . \\( -name a \\) -delete", "find . -exec rm {} \;", "ls | xargs -n 1 rm",
