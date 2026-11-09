@@ -26,9 +26,10 @@
  * 7. Usage-limit errors automatically resume after reset + one minute.
  *    Messages submitted while waiting join the thread without starting a turn.
  *    Timers belong only to the running session and are cleared on shutdown.
- * 8. Shell commands that delete files, discard work, or push to a remote ask
- *    first, one question at a time. Print and JSON runs block them. A
- *    blocked-state event is sent to Herdr meanwhile.
+ * 8. Shell commands that delete files or discard work, install or update
+ *    software or packages that stay installed, or push to a remote ask first,
+ *    one question at a time. Run-once tools such as npx do not ask. Print and
+ *    JSON runs block them. A blocked-state event is sent to Herdr meanwhile.
  *
  * Plan data refreshes when you send a message, after each turn, when the
  * agent settles, when you change model, and on /usage, but not more than
@@ -519,20 +520,145 @@ export function installAutoResume(
 
 // Pi runs every tool call without asking. This asks before shell commands that
 // can lose work for good or reach past this folder: deleted files, discarded
-// edits, and pushes to a remote. Commands that change nothing or can be undone
-// (git push --dry-run, rmdir, git tag -d, sudo by itself) run unasked. It reads
-// the command text, so a script that deletes (`npm run clean`) still runs
-// unasked: it is a guard, not a sandbox.
+// edits, package and software installs and updates that stay installed, and
+// pushes to a remote. Commands that change nothing or can be undone
+// (git push --dry-run, rmdir, git tag -d, sudo by itself) run unasked, and so do
+// run-once tools such as npx, which keep packages only in a cache. It reads the
+// command text, so a script that deletes (`npm run clean`) still runs unasked:
+// it is a guard, not a sandbox.
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
 const ALWAYS_ASK = new Set(["rm", "unlink", "shred", "srm", "truncate", "remove-item", "ri", "del", "erase", "rd"]);
-// Words and shell keywords that run the rest of the line as a command.
-const WRAPPERS = new Set(["env", "command", "exec", "nohup", "time", "nice", "builtin", "watch", "sudo", "doas", "if", "then", "else", "elif", "while", "until", "do", "!", "(", "{"]);
+// Words and shell keywords that run the rest of the line as a command. The
+// run-once runners (npx, pnpx, bunx, uvx) are wrappers too, so the command they
+// run is still checked: `npx pnpm install` asks, `npx prettier .` does not.
+const WRAPPERS = new Set(["env", "command", "exec", "nohup", "time", "nice", "builtin", "watch", "sudo", "doas", "npx", "pnpx", "bunx", "uvx", "if", "then", "else", "elif", "while", "until", "do", "!", "(", "{"]);
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish"]);
 const GIT_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
 const SQL_DROP = /\b(drop\s+(table|database|schema)|truncate\s+table)\b/i;
+// Install scripts that run as they download, as uv, rustup, bun, and Homebrew
+// suggest: `curl … | sh`, `bash -c "$(curl …)"`, and PowerShell's `irm … | iex`.
+const DOWNLOAD_AND_RUN = [
+	/\b(curl|wget|irm|iwr|invoke-restmethod|invoke-webrequest)\b[^;&|\n]*\|\s*(sudo\s+(-\S+\s+)*)?(\S*\/)?(sh|bash|zsh|dash|fish|iex|invoke-expression)\b/i,
+	/\b(sh|bash|zsh|dash|fish|source|eval)\s+(-\w*c\s+)?["']?(\$\(|<\()\s*(curl|wget)\b/i,
+	/\b(iex|invoke-expression)\s*\(+\s*(irm|iwr|invoke-restmethod|invoke-webrequest|new-object)\b/i,
+];
 const LOST_FILES = "Deletes files or folders. They do not go to the Trash, so you cannot get them back.";
 const LOST_CHANGES = "Puts files back to how they were at your last commit. Edits made since then are lost for good.";
 const LOST_DISK = "Erases a disk or changes how it is divided. All files on it can be lost.";
+const PACKAGE_INSTALL = "Installs packages. Their install code runs on this computer and can change anything.";
+const SOFTWARE_INSTALL = "Installs software on this computer.";
+const PACKAGE_UPDATE = "Updates packages. Code from the new versions runs on this computer.";
+const SOFTWARE_UPDATE = "Upgrades the software installed on this computer.";
+// Each trigger is a sequence of words that must appear together in order.
+// Run-once commands (`npm exec`, `npm create`, `pnpm dlx`, `yarn dlx`, `bun x`,
+// `uv tool run`, `pipx run`) keep packages only in a cache, so they are not here.
+const INSTALL_SUBCOMMANDS: Record<string, string[][]> = {
+	npm: [["install"], ["i"], ["add"], ["ci"], ["clean-install"], ["it"], ["install-test"], ["cit"], ["install-ci-test"]],
+	pnpm: [["install"], ["i"], ["add"]],
+	// Yarn 1's `yarn create` installs the starter globally before it runs it.
+	yarn: [["install"], ["add"], ["create"]],
+	bun: [["install"], ["i"], ["add"]],
+	deno: [["install"], ["add"]],
+	pip: [["install"]],
+	pip3: [["install"]],
+	poetry: [["install"], ["add"]],
+	// uv names its mode first: `uv pip install`, `uv tool install`.
+	uv: [["pip", "install"], ["tool", "install"], ["python", "install"], ["add"], ["sync"]],
+	pipx: [["install"], ["install-all"], ["inject"], ["reinstall"], ["reinstall-all"]],
+	cargo: [["install"], ["add"]],
+	gem: [["install"]],
+	bundle: [["install"], ["add"]],
+	composer: [["install"], ["require"]],
+	go: [["install"], ["get"]],
+	// `rustup toolchain install` matches ["install"] too.
+	rustup: [["install"], ["component", "add"], ["target", "add"]],
+	mise: [["install"], ["i"], ["use"], ["u"]],
+	asdf: [["install"]],
+	nvm: [["install"]],
+	fnm: [["install"]],
+	volta: [["install"]],
+	pyenv: [["install"]],
+	rbenv: [["install"]],
+	brew: [["install"], ["reinstall"]],
+	apt: [["install"]],
+	"apt-get": [["install"]],
+	dnf: [["install"]],
+	yum: [["install"]],
+	apk: [["add"]],
+	snap: [["install"]],
+	winget: [["install"]],
+	choco: [["install"]],
+	scoop: [["install"]],
+};
+// Toolchains, language versions, and system packages count as software.
+const SOFTWARE_INSTALLERS = new Set(["rustup", "mise", "asdf", "nvm", "fnm", "volta", "pyenv", "rbenv", "brew", "apt", "apt-get", "dnf", "yum", "apk", "snap", "winget", "choco", "scoop"]);
+// PowerShell installs and updates come as one word. Other install-* programs,
+// such as install-info, are not installs.
+const POWERSHELL_INSTALLS = new Set(["install-module", "install-package", "install-script", "install-psresource"]);
+const POWERSHELL_UPDATES = new Set(["update-module", "update-script", "update-psresource"]);
+// Bare `yarn` and `bundle` run their install, even with options.
+const BARE_INSTALLS = new Set(["yarn", "bundle"]);
+const INFO_OPTIONS = new Set(["--version", "-v", "--help", "-h"]);
+// Words that end subcommand matching: everything after them is a script name,
+// a test filter, or another command's operands.
+const BOUNDARY_WORDS = new Set(["run", "task", "test", "bench", "uninstall", "remove", "rm", "un", "search", "list", "show", "info", "view", "help"]);
+// Updaters change installed packages or software in place, so they ask too.
+// `apt update` and `brew update` only refresh package lists and stay unasked.
+const UPDATE_SUBCOMMANDS: Record<string, string[][]> = {
+	npm: [["update"], ["up"], ["upgrade"], ["audit", "fix"]],
+	pnpm: [["update"], ["up"], ["upgrade"]],
+	yarn: [["upgrade"], ["upgrade-interactive"], ["up"]],
+	bun: [["update"], ["upgrade"]],
+	deno: [["upgrade"]],
+	poetry: [["update"]],
+	composer: [["update"]],
+	cargo: [["update"]],
+	gem: [["update"]],
+	bundle: [["update"]],
+	uv: [["tool", "upgrade"], ["self", "update"]],
+	pipx: [["upgrade"], ["upgrade-all"], ["upgrade-shared"]],
+	rustup: [["update"]],
+	mise: [["upgrade"], ["up"], ["self-update"]],
+	brew: [["upgrade"]],
+	apt: [["upgrade"], ["full-upgrade"], ["dist-upgrade"]],
+	"apt-get": [["upgrade"], ["full-upgrade"], ["dist-upgrade"]],
+	dnf: [["update"], ["upgrade"]],
+	yum: [["update"], ["upgrade"]],
+	apk: [["upgrade"]],
+	snap: [["refresh"]],
+	winget: [["upgrade"]],
+	choco: [["upgrade"]],
+	scoop: [["update"]],
+};
+
+function installOrUpdateReason(program: string, args: string[]): string | undefined {
+	if (POWERSHELL_INSTALLS.has(program)) return SOFTWARE_INSTALL;
+	if (POWERSHELL_UPDATES.has(program)) return SOFTWARE_UPDATE;
+	// pacman names its operation with an option: -S installs and -Su upgrades,
+	// but -Ss, -Si, -Sl, -Sg, -Sc, -Sp, and -Sw only search, show, clean, or
+	// download. -U installs a package file.
+	if (program === "pacman") {
+		if (args.some(arg => /^-U[a-zA-Z]*$/.test(arg))) return SOFTWARE_INSTALL;
+		const sync = args.find(arg => /^-S[a-zA-Z]*$/.test(arg))?.slice(2);
+		if (sync === undefined || /[silgcpw]/.test(sync)) return undefined;
+		return sync.includes("u") ? SOFTWARE_UPDATE : args.some(arg => !arg.startsWith("-")) ? SOFTWARE_INSTALL : undefined;
+	}
+	const sequences = INSTALL_SUBCOMMANDS[program];
+	const updates = UPDATE_SUBCOMMANDS[program];
+	if (!sequences && !updates) return undefined;
+	const bare = BARE_INSTALLS.has(program) && args.every(arg => arg.startsWith("-") && !INFO_OPTIONS.has(arg));
+	// A script name after `npm run`, `deno task`, and the like is not a subcommand.
+	const boundary = args.findIndex(arg => BOUNDARY_WORDS.has(arg) || arg === "--");
+	const scope = boundary >= 0 ? args.slice(0, boundary) : args;
+	const matches = (seq: string[][]) => scope.some((_, n) => seq.some(words => words.every((word, k) => scope[n + k] === word)));
+	const system = SOFTWARE_INSTALLERS.has(program);
+	if (bare || (sequences && matches(sequences))) return system ? SOFTWARE_INSTALL : PACKAGE_INSTALL;
+	// Bare `scoop update` only refreshes scoop and its buckets, and bare
+	// `winget upgrade` only lists what could be upgraded.
+	if ((program === "scoop" || program === "winget") && args.length === 1) return undefined;
+	if (updates && matches(updates)) return system ? SOFTWARE_UPDATE : PACKAGE_UPDATE;
+	return undefined;
+}
 
 function gitReason(args: string[]): string | undefined {
 	let i = 0;
@@ -581,6 +707,10 @@ const WRAPPER_VALUE_OPTIONS: Record<string, Set<string>> = {
 	time: new Set(["-f", "--format", "-o", "--output"]),
 	sudo: new Set(["-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-p", "--prompt", "-r", "--role", "-t", "--type", "-U", "--other-user", "-T", "--command-timeout"]),
 	doas: new Set(["-u", "-C"]),
+	npx: new Set(["-p", "--package"]),
+	pnpx: new Set(["--package"]),
+	bunx: new Set(["-p", "--package"]),
+	uvx: new Set(["--from", "--with", "-p", "--python"]),
 };
 
 function segmentReason(words: string[]): string | undefined {
@@ -601,8 +731,9 @@ function segmentReason(words: string[]): string | undefined {
 		}
 		if (wrapper === "timeout") i++; // Duration before the command.
 	}
-	// `(rm x)` and `{rm x;}` leave a bracket on the program word.
-	const program = words[i]?.replace(/^[({]+/, "").split("/").pop()?.toLowerCase();
+	// `(rm x)` and `{rm x;}` leave a bracket on the program word, and
+	// `npx pnpm@9 install` leaves a version after it.
+	const program = words[i]?.replace(/^[({]+/, "").split("/").pop()?.replace(/@.*$/, "").toLowerCase();
 	const args = words.slice(i + 1);
 	if (!program) return undefined;
 	// Quotes are already gone, so `bash -c "…"` and `eval "…"` are checked as commands.
@@ -612,7 +743,9 @@ function segmentReason(words: string[]): string | undefined {
 		return script < 0 ? undefined : segmentReason(args.slice(script + 1));
 	}
 	// xargs options can take values, so any later word may be the program it runs.
-	if (program === "xargs") return args.map((_, n) => segmentReason(args.slice(n))).find(Boolean);
+	// xargs adds its input as more arguments, so that program never runs bare:
+	// `xargs grep -l yarn` does not run `yarn` by itself.
+	if (program === "xargs") return args.map((_, n) => segmentReason([...args.slice(n), "<input>"])).find(Boolean);
 	// rmdir removes only empty folders, but PowerShell's rmdir is Remove-Item, and
 	// cmd's `rmdir /s` deletes a whole folder.
 	if (program === "rmdir" && args.some(arg => /^(-r|\/s$)/i.test(arg))) return LOST_FILES;
@@ -623,8 +756,8 @@ function segmentReason(words: string[]): string | undefined {
 	if (program.startsWith("mkfs")) return LOST_DISK;
 	if (program === "diskutil" && args.some(arg => /^(erase|zero|reformat|partition|secureerase)/i.test(arg))) return LOST_DISK;
 	if (program === "find") {
-		// The command find runs is what can lose work, so use its own reason; a
-		// push inside -exec must not be described as deleting files.
+		// The command find runs is what can lose work, so use its own reason; an
+		// install or push inside -exec must not be described as deleting files.
 		for (let n = 0; n < args.length; n++) {
 			if (!/^-(exec|execdir|ok|okdir)$/.test(args[n])) continue;
 			const execReason = segmentReason(args.slice(n + 1));
@@ -640,7 +773,7 @@ function segmentReason(words: string[]): string | undefined {
 	if (program === "docker" && !args.some(arg => arg === "rmi" || arg === "image") && args.some(arg => arg === "rm" || arg === "prune")) return "Deletes Docker containers or their stored data. That data is lost for good.";
 	if (program === "kubectl" && args.includes("delete")) return "Deletes parts of an app that runs on a Kubernetes cluster. The app can stop, and its data can be lost.";
 	if (program === "terraform" && args.includes("destroy")) return "Deletes the servers and other online services that Terraform set up. Their data can be lost.";
-	return undefined;
+	return installOrUpdateReason(program, args);
 }
 
 /** Why a shell command needs the user's permission, or undefined when it does not. */
@@ -655,6 +788,7 @@ export function destructiveReason(command: string): string | undefined {
 		if (targets.length) return `Deletes ${targets.join(", ")}${recursive ? ` and everything inside ${them}` : ""}. You cannot get ${them} back.`;
 	}
 	if (SQL_DROP.test(command)) return "Deletes a database table or all its data. You cannot get it back without a backup.";
+	if (DOWNLOAD_AND_RUN.some(pattern => pattern.test(command))) return "Downloads a script and runs it at once. Install scripts like this put software on this computer and can change anything.";
 	// Quotes are dropped and every separator splits, even inside quotes: a quoted
 	// `rm` may then ask once more than needed, but `bash -c "x; rm y"` cannot hide.
 	// A closing bracket is dropped too, so `(cd repo && git reset --hard)` reads `--hard`.
