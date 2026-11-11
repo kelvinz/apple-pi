@@ -84,7 +84,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 	return { ...exports, requests, sentHeaders, fileReads };
 }
 
-const { formatReset, reflowText } = loadExtension();
+const { formatReset, expectedLeft, reflowText } = loadExtension();
 const row = (windowSeconds, stamp = resetAt) => ({ label: "test", resetAt: stamp, windowSeconds });
 
 test("hourly windows show local 24-hour time without a date", () => {
@@ -122,6 +122,20 @@ test("passed resets keep their time; missing or invalid timestamps show no reset
 	for (const stamp of [undefined, NaN, Infinity, 1e20]) {
 		assert.equal(formatReset({ label: "test", resetAt: stamp }, now), "");
 	}
+});
+
+test("the expected share left is the time to the reset over the window length", () => {
+	assert.equal(expectedLeft(row(5 * hour), resetAt - 5 * hour * 1000), 1);
+	assert.equal(expectedLeft(row(5 * hour), resetAt - 2 * hour * 1000), 0.4);
+	assert.equal(expectedLeft(row(7 * day), resetAt - 1.75 * day * 1000), 0.25);
+	assert.equal(expectedLeft(row(5 * hour), resetAt - 6 * hour * 1000), 1, "A reset further away than the window is a full window");
+});
+
+test("rows without a future reset or a window length have no expected share", () => {
+	for (const stamp of [resetAt, resetAt + 60_000, undefined, NaN, Infinity, 1e20]) {
+		assert.equal(expectedLeft({ label: "test", windowSeconds: 5 * hour, resetAt: stamp }, resetAt + 60_000), undefined);
+	}
+	for (const duration of [undefined, 0, -1, NaN]) assert.equal(expectedLeft(row(duration), now), undefined);
 });
 
 const codexWindow = duration => ({ limit_window_seconds: duration, used_percent: 25, reset_at: resetAt / 1000 });
@@ -218,6 +232,41 @@ async function createFooter(provider, theme, status = 200, options = {}) {
 
 const plainTheme = { fg: (_, text) => text, bold: text => text };
 const plainText = footer => footer.render(240).map(tui.stripTerminalSequences).join(" ");
+
+test("each bar has a thin line cut out at the expected share left", async () => {
+	const accentCode = "\x1b[38;2;163;205;242m";
+	const theme = {
+		fg: (role, text) => role === "accent" ? `${accentCode}${text}\x1b[39m` : `\x1b[90m${text}\x1b[39m`, bold: text => text,
+		getFgAnsi: () => accentCode,
+	};
+	const accent = text => theme.fg("accent", text);
+	// The line's cell is filled in reverse video with the shade its neighbours
+	// show: the accent at 75% (for `▓`) or 25% (for `░`) over a dark terminal.
+	const lineOn = shade => `\x1b[7m\x1b[38;2;${shade}m▏\x1b[27m\x1b[39m`;
+	// 25% used with 3h 42m to go: on pace for 5 hours, far ahead for a week.
+	const { footer } = await createFooter("openai-codex", theme);
+	const lines = footer.render(240);
+	const fiveHour = lines.find(text => text.includes("5-hour"));
+	const weekly = lines.find(text => text.includes("weekly"));
+	assert.ok(fiveHour.includes(accent("▓▓▓▓▓▓▓") + lineOn("129;161;191") + accent("░░")), JSON.stringify(fiveHour));
+	assert.ok(weekly.includes(accent("") + lineOn("129;161;191") + accent("▓▓▓▓▓▓▓░░")), JSON.stringify(weekly));
+	// With 20% left but 74% of the window still to go, the line is in the used part.
+	const spendingTooFast = await createFooter("openai-codex", theme, 200, { responses: {
+		[fixtures["openai-codex"].url]: { rate_limit: { primary_window: { ...codexWindow(5 * hour), used_percent: 80 } } },
+	} });
+	const tooFast = spendingTooFast.footer.render(240).find(text => text.includes("5-hour"));
+	assert.ok(tooFast.includes(accent("▓▓░░░░░") + lineOn("60;73;88") + accent("░░")), JSON.stringify(tooFast));
+	// A window that has not started has no reset, so it has no line.
+	const zai = await createFooter("zai", theme);
+	const idle = zai.footer.render(240).find(text => text.includes("100% left"));
+	assert.ok(idle.includes(accent("▓▓▓▓▓▓▓▓▓▓")), JSON.stringify(idle));
+	for (const width of [20, 32, 40, 60, 100]) {
+		assert.ok(footer.render(width).every(text => tui.visibleWidth(text) <= width), `Overflow at width ${width}`);
+	}
+	// A theme without a 24-bit accent colour gets the line alone.
+	const plain = (await createFooter("openai-codex", plainTheme)).footer.render(240).find(text => text.includes("5-hour"));
+	assert.ok(plain.includes("▓▓▓▓▓▓▓▏░░"), plain);
+});
 
 for (const provider of Object.keys(fixtures)) {
 	test(`${provider}: provider parsing, extra buckets, and width-safe reset wrapping`, async () => {

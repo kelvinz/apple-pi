@@ -5,6 +5,7 @@
  *
  * 1. A footer showing the current provider's plan usage
  *    (windows with percent left, a countdown, and the local reset time).
+ *    A thin line cut into each bar marks the share that even use would leave.
  *    Codex, OpenAI subscription (via Codex CLI quota), and Z.ai.
  *    Anthropic does not allow subscription use outside its own apps,
  *    and zai-coding-cn is the China-only plan.
@@ -60,6 +61,11 @@ const CODEX_CLI_EXPIRED_NOTE = "token expired — use codex or run codex login";
 // Notes carrying a command to run, wrapped so the command stays complete.
 const SETUP_NOTES = [TOKEN_EXPIRED_NOTE, CODEX_CLI_SETUP_NOTE, CODEX_CLI_EXPIRED_NOTE];
 const BAR_WIDTH = 10;
+// The thinnest line a terminal cell can hold: one eighth of the cell.
+const PACE_MARK = "▏";
+// The terminal does not report its background to extensions. This dark blue
+// is the one measured in the terminal this extension is used in.
+const ASSUMED_TERMINAL_BG = [26, 29, 37];
 // Built once: the footer re-renders on every frame, and building a formatter
 // per row per frame is the most expensive thing on that path.
 const RESET_DATE = new Intl.DateTimeFormat("en-GB", { weekday: "short", day: "numeric", month: "short" });
@@ -104,6 +110,16 @@ const WARNING_MESSAGES: Record<WarningCategory, string> = {
 	"tool-render": "apple-pi tool renderer unavailable",
 	registration: "apple-pi registration unavailable",
 };
+
+// The share of a window's allowance that is left when you spend it evenly: the
+// time until the reset over the window's length, from 0 to 1. Rows without a
+// future reset or a known length have no pace to compare with.
+export function expectedLeft(row: Row, now = Date.now()): number | undefined {
+	const { resetAt, windowSeconds } = row;
+	if (resetAt === undefined || !Number.isFinite(new Date(resetAt).getTime()) || resetAt <= now) return undefined;
+	if (windowSeconds === undefined || !(windowSeconds > 0)) return undefined;
+	return Math.min((resetAt - now) / (windowSeconds * 1000), 1);
+}
 
 // pi provider id -> usage cache key
 const PROVIDER_KEYS: Record<string, string> = {
@@ -1064,6 +1080,12 @@ export default function (pi: ExtensionAPI) {
 		return "▓".repeat(filled) + "░".repeat(barWidth - filled);
 	}
 
+	// The cell that holds the pace line. Colour that reaches past the line is
+	// quota to spare; a line out in the used part means too much is used.
+	function paceCell(expected: number | undefined, barWidth: number): number | undefined {
+		return expected === undefined ? undefined : Math.min(Math.floor(expected * barWidth), barWidth - 1);
+	}
+
 	function pctText(used: number | undefined): string {
 		return used === undefined ? "?% left" : `${percentLeft(used)}% left`;
 	}
@@ -1400,6 +1422,16 @@ export default function (pi: ExtensionAPI) {
 		const indent = aligned ? " ".repeat(visibleWidth(prefix)) : "  ";
 		const lines: string[] = [];
 		const sep = " · ";
+		// The bar stays `▓` and `░` in the accent colour. Only the cell that holds
+		// the pace line is painted, in reverse video: the cell is filled with one
+		// flat colour and the line is cut out of it in the terminal's background.
+		// The flat colour copies its neighbours: terminals draw `▓` and `░` as the
+		// accent at three quarters and one quarter strength over the background.
+		let accentCode = "";
+		try { accentCode = theme?.getFgAnsi?.("accent") ?? ""; } catch { /* A theme without colour codes. */ }
+		const accentRgb = /^\x1b\[38;2;(\d+);(\d+);(\d+)m$/.exec(accentCode)?.slice(1).map(Number);
+		const shade = (cover: number): string =>
+			`\x1b[38;2;${accentRgb!.map((channel, at) => Math.round(channel * cover + ASSUMED_TERMINAL_BG[at] * (1 - cover))).join(";")}m`;
 		rows.forEach((r, i) => {
 			// Name rides on the first row; later rows align under it.
 			const head = i === 0 ? bold(fg("accent", prefix)) : indent;
@@ -1414,7 +1446,17 @@ export default function (pi: ExtensionAPI) {
 			// The bar is decoration and the number is not, so the bar gives up its
 			// columns first, and disappears rather than shrink to an unreadable stub.
 			const barWidth = Math.min(BAR_WIDTH, width - headWidth - visibleWidth(labelPart) - visibleWidth(pctPart) - 2);
-			const barPart = barWidth >= 3 ? `${fg("accent", bar(r.pct, barWidth))}  ` : "";
+			const cells = barWidth >= 3 ? bar(r.pct, barWidth) : "";
+			const pace = r.pct === undefined ? undefined : paceCell(expectedLeft(r), barWidth);
+			// Without a 24-bit accent colour the line's cell cannot be painted to
+			// match, so the line stands alone in the text colour.
+			const mark = pace === undefined ? ""
+				: accentRgb ? `\x1b[7m${shade(cells[pace] === "▓" ? 0.75 : 0.25)}${PACE_MARK}\x1b[27m\x1b[39m`
+				: fg("text", PACE_MARK);
+			const barText = pace === undefined
+				? fg("accent", cells)
+				: `${fg("accent", cells.slice(0, pace))}${mark}${fg("accent", cells.slice(pace + 1))}`;
+			const barPart = cells ? `${barText}  ` : "";
 			const core = `${head}${fg("muted", labelPart)}${barPart}${fg("muted", pctPart)}`;
 			const reset = formatReset(r);
 			const resetText = reset ? fg("muted", reset) : "";

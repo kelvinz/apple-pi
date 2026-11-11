@@ -4,7 +4,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 
 ## Features
 
-- Provider usage for Codex and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. The new OpenAI subscription login can show separately labelled Codex CLI quota from an existing CLI login. Extra Codex quota windows appear when the provider reports them. A failed refresh keeps the last good numbers and adds a "showing last result" line. Other providers and ordinary OpenAI API-key setups show "no usage endpoint".
+- Provider usage for Codex and Z.ai: percentage left, a usage bar, a reset countdown, and the local reset time. A thin line cut into each bar marks how much would be left if you used the window evenly: colour past the line is quota to spare, and a line out in the used part means you are using it too fast. The new OpenAI subscription login can show separately labelled Codex CLI quota from an existing CLI login. Extra Codex quota windows appear when the provider reports them. A failed refresh keeps the last good numbers and adds a "showing last result" line. Other providers and ordinary OpenAI API-key setups show "no usage endpoint".
 - A footer with the directory, Git branch, session name, token use, cost, context use, model, thinking level, average output speed of recent replies, and extension status.
 - Small titles above tool calls, assistant replies, and thinking blocks. Built-in tool results and expand/collapse controls stay in place.
 - A **previous message** button above the fullscreen editor.
