@@ -798,7 +798,7 @@ function segmentReason(words: string[]): string | undefined {
 
 // An `rm` or `unlink` runs unasked when every file it names is throwaway:
 // inside a temp or cache folder, in a git-ignored project folder with a
-// scratch-style name or listed in the project's `.pi/apple-pi.json`, or a new
+// scratch-style name or listed for the project in `~/.pi/agent/apple-pi.json`, or a new
 // file that the agent wrote this session. The commands are parsed as shell
 // text; anything that the parser cannot read for certain still asks.
 
@@ -1069,15 +1069,28 @@ function withoutThrowawayDeletes(command: string, files: GuardFiles): string {
 	return command;
 }
 
-function isGuardConfig(path: string): boolean {
-	return basename(path) === GUARD_CONFIG && basename(dirname(path)) === ".pi";
+// Pi's own path rules: an `@` prefix is dropped and `~` is home.
+function piPath(cwd: string, given: string): string {
+	const path = given.replace(/^@/, "");
+	return resolve(cwd, path === "~" || path.startsWith("~/") ? homedir() + path.slice(1) : path);
 }
 
-// Folders that `.pi/apple-pi.json` lists under "throwaway", relative to the project.
-function configuredThrowaway(top: string): string[] {
+// The config sits in Pi's agent folder, outside every project, so a cloned
+// project cannot ship one that marks its `.env` throwaway.
+function isGuardConfig(path: string, real: (path: string) => string): boolean {
+	return path === real(join(getAgentDir(), GUARD_CONFIG));
+}
+
+// Folders that the config lists under "throwaway" for the project at `top`,
+// relative to it. Each key is a project folder, absolute or starting with `~/`.
+function configuredThrowaway(top: string, real: (path: string) => string): string[] {
 	try {
-		const folders: unknown = JSON.parse(readFileSync(join(top, ".pi", GUARD_CONFIG), "utf8"))?.throwaway;
-		if (!Array.isArray(folders)) return [];
+		const projects: unknown = JSON.parse(readFileSync(join(getAgentDir(), GUARD_CONFIG), "utf8"))?.throwaway;
+		if (!projects || typeof projects !== "object" || Array.isArray(projects)) return [];
+		const folders = Object.entries(projects)
+			.filter(([project, list]) => Array.isArray(list) && (isAbsolute(project) || project === "~" || project.startsWith("~/"))
+				&& real(piPath("/", project)) === top)
+			.flatMap(([, list]) => list as unknown[]);
 		return folders.filter((folder): folder is string => typeof folder === "string")
 			.map(folder => normalize(folder).replace(/[\\/]+$/, ""))
 			.filter(folder => folder && folder !== "." && !isAbsolute(folder) && !folder.split(sep).includes(".."));
@@ -1123,10 +1136,7 @@ export function throwawayFiles(cwd: string, created: ReadonlySet<string>, roots?
 				const top = real(git(dir, ["rev-parse", "--show-toplevel"]).trim());
 				if (!inside(top, path)) return false;
 				const rel = relative(top, path);
-				// Only a config the user made here counts: a tracked one can come from
-				// a cloned project and would let it mark files such as `.env` throwaway.
-				const listed = () => git(top, ["ls-files", "--", join(".pi", GUARD_CONFIG)]) === ""
-					&& configuredThrowaway(top).some(folder => rel === folder || rel.startsWith(folder + sep));
+				const listed = () => configuredThrowaway(top, real).some(folder => rel === folder || rel.startsWith(folder + sep));
 				if (!rel.split(sep).some(part => SCRATCH_NAME.test(part)) && !listed()) return false;
 				// Git must ignore it, and nothing in it may be tracked: tracked files can
 				// hold edits that were never committed. check-ignore fails when not ignored.
@@ -1283,14 +1293,13 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 			// differently (`rm /tmp/a,~/b` is two paths), so it always asks.
 			reason = destructiveReason(command, ctx.cwd && event.toolName === "bash" ? throwawayFiles(ctx.cwd, created) : undefined);
 		} else if ((event.toolName === "write" || event.toolName === "edit") && ctx.cwd) {
-			// Pi's own path rules: an `@` prefix is dropped and `~` is home.
-			const given = String((event.input as { path?: unknown }).path ?? "").replace(/^@/, "");
-			const path = resolve(ctx.cwd, given === "~" || given.startsWith("~/") ? homedir() + given.slice(1) : given);
+			const given = String((event.input as { path?: unknown }).path ?? "");
+			const path = piPath(ctx.cwd, given);
 			const files = throwawayFiles(ctx.cwd, created);
 			// A file the agent writes new is its own, so it may delete it unasked.
 			if (event.toolName === "write" && !existsSync(path)) created.add(files.real(path));
-			if (!isGuardConfig(files.real(path))) return undefined;
-			command = `${event.toolName} ${given}`;
+			if (!isGuardConfig(files.real(path), files.real)) return undefined;
+			command = `${event.toolName} ${given.replace(/^@/, "")}`;
 			reason = CONFIG_CHANGE;
 		} else return undefined;
 		if (!reason) return undefined;

@@ -1614,7 +1614,7 @@ test("guard: deletes that might reach past throwaway files still ask", () => {
 		// Other parts still ask, and text the parser cannot read asks as before.
 		"rm /tmp/x && npm install", "rm /tmp/x\nrm src/a", "rm /tmp/x 'unclosed", "cat <<EOF\nrm src/a",
 		// The config decides what is throwaway.
-		"echo '{}' > .pi/apple-pi.json", "cp /tmp/x .pi/apple-pi.json",
+		"echo '{}' > ~/.pi/agent/apple-pi.json", "cp /tmp/x ~/.pi/agent/apple-pi.json",
 	]) assert.ok(destructiveReason(command, fakeFiles()), command);
 	assert.equal(destructiveReason("rm /tmp/x && rm src/app.ts", fakeFiles()), "Deletes files or folders. They do not go to the Trash, so you cannot get them back.");
 	// A relative path needs a folder that CDPATH cannot redirect.
@@ -1633,8 +1633,9 @@ test("guard: real files: ignored scratch folders, configured folders, and new fi
 		sh("add", ".gitignore", "src/app.ts", "src/tmp/kept.ts");
 		sh("add", "-f", "forced-scratch/keep");
 		realFs.symlinkSync(join(root, "src"), join(root, "verify-evidence", "link"));
-		const config = join(root, ".pi", "apple-pi.json");
-		const { destructiveReason, throwawayFiles } = loadExtension({}, { status: 200, files: { [config]: { throwaway: ["verify-evidence/", "../outside", "/abs"] } } });
+		// Only the entry for this project counts, and only safe relative folders in it.
+		const config = { throwaway: { [root]: ["verify-evidence/", "../outside", "/abs"], "/other": ["exports"], "relative": ["exports"] } };
+		const { destructiveReason, throwawayFiles } = loadExtension({}, { status: 200, files: { "/mock-agent/apple-pi.json": config } });
 		const created = new Set([join(root, "src", "fixture.test.ts")]);
 		const files = throwawayFiles(root, created, ["/mock-tmp"]);
 		for (const command of [
@@ -1649,11 +1650,6 @@ test("guard: real files: ignored scratch folders, configured folders, and new fi
 			// The symlink's target, not the link.
 			"rm -rf verify-evidence/link/", "rm verify-evidence/link/app.ts",
 		]) assert.ok(destructiveReason(command, files), command);
-		// A config that git tracks can come from a cloned project, so it does not count.
-		write(".pi/apple-pi.json", "{}");
-		sh("add", ".pi/apple-pi.json");
-		assert.ok(destructiveReason("rm -f verify-evidence/f-35/*.png", files));
-		assert.equal(destructiveReason("rm -rf out-scratch", files), undefined);
 	} finally {
 		realFs.rmSync(root, { recursive: true, force: true });
 	}
@@ -1676,10 +1672,12 @@ test("guard: a file that write creates may be deleted unasked; the guard config 
 		assert.equal(await run.call("write", { path: "old.ts", content: "y" }), undefined);
 		assert.equal(await run.call("bash", { command: "rm src/new.test.ts" }), undefined);
 		assert.equal((await run.call("bash", { command: "rm old.ts" })).block, true);
-		assert.equal((await run.call("edit", { path: ".pi/apple-pi.json", edits: [] })).block, true);
-		assert.equal((await run.call("write", { path: "@.pi/apple-pi.json", content: "{}" })).block, true);
+		assert.equal((await run.call("edit", { path: "/mock-agent/apple-pi.json", edits: [] })).block, true);
+		assert.equal((await run.call("write", { path: "@/mock-agent/apple-pi.json", content: "{}" })).block, true);
+		// A copy inside a project is not read, so changing it does not ask.
+		assert.equal(await run.call("edit", { path: ".pi/apple-pi.json", edits: [] }), undefined);
 		assert.equal(run.asked.length, 3);
-		assert.match(run.asked[1][0], /Command:\nedit \.pi\/apple-pi\.json$/);
+		assert.match(run.asked[1][0], /Command:\nedit \/mock-agent\/apple-pi\.json$/);
 		// PowerShell lists and quotes differently, so its deletes always ask.
 		assert.equal(await run.call("write", { path: "made.ps1", content: "x" }), undefined);
 		assert.equal((await run.call("powershell", { command: "rm made.ps1" })).block, true);
