@@ -48,9 +48,10 @@
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDataProvider, Theme, ThemeColor, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, sep } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
 const MIN_FETCH_GAP_MS = 60 * 1000;
 const FETCH_TIMEOUT_MS = 10 * 1000;
@@ -541,7 +542,8 @@ export function installAutoResume(
 // (git push --dry-run, rmdir, git tag -d, sudo by itself) run unasked, and so do
 // run-once tools such as npx, which keep packages only in a cache. It reads the
 // command text, so a script that deletes (`npm run clean`) still runs unasked:
-// it is a guard, not a sandbox.
+// it is a guard, not a sandbox. Deletes of throwaway files (temp, caches,
+// ignored scratch folders, files the agent wrote this session) run unasked.
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
 const ALWAYS_ASK = new Set(["rm", "unlink", "shred", "srm", "truncate", "remove-item", "ri", "del", "erase", "rd"]);
 // Words and shell keywords that run the rest of the line as a command. The
@@ -792,8 +794,361 @@ function segmentReason(words: string[]): string | undefined {
 	return installOrUpdateReason(program, args);
 }
 
+// ---------- throwaway deletes ----------
+
+// An `rm` or `unlink` runs unasked when every file it names is throwaway:
+// inside a temp or cache folder, in a git-ignored project folder with a
+// scratch-style name or listed in the project's `.pi/apple-pi.json`, or a new
+// file that the agent wrote this session. The commands are parsed as shell
+// text; anything that the parser cannot read for certain still asks.
+
+/** What the guard knows about files. Every path is absolute. */
+export type GuardFiles = {
+	cwd: string;
+	home: string;
+	/** The path with symlinks resolved in each folder of it that exists. */
+	real: (path: string) => string;
+	isDirectory: (path: string) => boolean;
+	/** True when this real path, and everything in it, can be deleted unasked. */
+	throwaway: (path: string) => boolean;
+	/** True for a temp or cache folder itself, whose entries are all throwaway. */
+	tempRoot: (path: string) => boolean;
+};
+
+// `glob` is where the first unquoted `*`, `?`, or `[` is in `text`, or -1.
+// `literal` is false when the shell would change the word: variables, command
+// output, or braces. `tilde` is an unquoted `~` at the start.
+type ShellWord = { text: string; literal: boolean; glob: number; tilde: boolean };
+// `next` is the separator after the command; "group" marks a bracket.
+type ShellCommand = { start: number; end: number; words: ShellWord[]; depth: number; next: string };
+
+const DELETERS = new Set(["rm", "unlink"]);
+const GUARD_CONFIG = "apple-pi.json";
+const CONFIG_CHANGE = "Changes which folders apple-pi lets the agent delete without asking.";
+// Folder names such as scratch, verify-scratch, tmp, .cache.
+const SCRATCH_NAME = /^(.*[-_.])?(scratch|tmp|temp|cache)$/i;
+const CWD_CHANGERS = /(^|[^\w-])(cd|pushd|popd)([^\w-]|$)/;
+
+/** Splits shell text into simple commands, or undefined when it cannot be read for certain. */
+function parseShell(src: string): ShellCommand[] | undefined {
+	const commands: ShellCommand[] = [];
+	const heredocs: { delimiter: string; tabs: boolean }[] = [];
+	let i = 0, depth = 0, start = -1, end = -1;
+	let words: ShellWord[] = [];
+	const finish = (next: string) => {
+		if (start >= 0) commands.push({ start, end, words, depth, next });
+		words = [];
+		start = -1;
+	};
+	// From an opening bracket to just after the bracket that closes it.
+	const skipBrackets = (from: number): number => {
+		let level = 0;
+		for (let j = from; j < src.length; j++) {
+			const c = src[j];
+			if (c === "\\") j++;
+			else if (c === "'") { j = src.indexOf("'", j + 1); if (j < 0) return -1; }
+			else if (c === '"') { j++; while (j < src.length && src[j] !== '"') j += src[j] === "\\" ? 2 : 1; if (j >= src.length) return -1; }
+			else if (c === "(") level++;
+			else if (c === ")" && --level === 0) return j + 1;
+		}
+		return -1;
+	};
+	const skipBackticks = (from: number): number => {
+		let j = from + 1;
+		while (j < src.length && src[j] !== "`") j += src[j] === "\\" ? 2 : 1;
+		return j < src.length ? j + 1 : -1;
+	};
+	// `$(…)`, `${…}`, `$'…'`, or `$name`, from the `$`.
+	const skipDollar = (from: number): number => {
+		if (src[from + 1] === "(") return skipBrackets(from + 1);
+		if (src[from + 1] === "{") { const close = src.indexOf("}", from + 2); return close < 0 ? -1 : close + 1; }
+		if (src[from + 1] === "'") {
+			let j = from + 2;
+			while (j < src.length && src[j] !== "'") j += src[j] === "\\" ? 2 : 1;
+			return j < src.length ? j + 1 : -1;
+		}
+		return from + 1;
+	};
+	const readWord = (): ShellWord | undefined => {
+		const begin = i;
+		let text = "", literal = true, glob = -1;
+		while (i < src.length) {
+			const c = src[i];
+			if (c === "(" && i > begin) {
+				// Arrays and extended globs, such as `a=(x y)`.
+				literal = false;
+				i = skipBrackets(i);
+				if (i < 0) return undefined;
+				continue;
+			}
+			if (" \t\n;&|()<>".includes(c)) break;
+			if (c === "\\") {
+				if (src[i + 1] !== "\n") text += src[i + 1] ?? "";
+				i += 2;
+			} else if (c === "'") {
+				const close = src.indexOf("'", i + 1);
+				if (close < 0) return undefined;
+				text += src.slice(i + 1, close);
+				i = close + 1;
+			} else if (c === '"') {
+				i++;
+				for (;;) {
+					if (i >= src.length) return undefined;
+					const d = src[i];
+					if (d === '"') { i++; break; }
+					if (d === "\\" && '$`"\\\n'.includes(src[i + 1] ?? "")) {
+						if (src[i + 1] !== "\n") text += src[i + 1];
+						i += 2;
+					} else if (d === "$" || d === "`") {
+						literal = false;
+						i = d === "$" ? skipDollar(i) : skipBackticks(i);
+						if (i < 0) return undefined;
+					} else {
+						text += d;
+						i++;
+					}
+				}
+			} else if (c === "$" || c === "`") {
+				literal = false;
+				i = c === "$" ? skipDollar(i) : skipBackticks(i);
+				if (i < 0) return undefined;
+			} else {
+				if ("*?[".includes(c) && glob < 0) glob = text.length;
+				if (c === "{" || c === "}") literal = false;
+				text += c;
+				i++;
+			}
+		}
+		// `~"/x"` is not expanded: the `~` must end at an unquoted slash or the word's end.
+		return { text, literal, glob, tilde: src[begin] === "~" && (begin + 1 === i || src[begin + 1] === "/") };
+	};
+	const readRedirect = (): boolean => {
+		const op = /^(&>>|&>|<<<|<<-|<<|<>|<&|>&|>>|>\||<|>)/.exec(src.slice(i))![0];
+		if ((op === "<" || op === ">") && src[i + 1] === "(") {
+			i = skipBrackets(i + 1);
+			return i >= 0;
+		}
+		i += op.length;
+		while (src[i] === " " || src[i] === "\t") i++;
+		if ((op === ">&" || op === "<&") && /[\d-]/.test(src[i] ?? "")) {
+			while (/[\d-]/.test(src[i] ?? "")) i++;
+			return true;
+		}
+		const target = readWord();
+		if (!target || (!target.text && target.literal)) return false;
+		if (op === "<<" || op === "<<-") heredocs.push({ delimiter: target.text, tabs: op === "<<-" });
+		return true;
+	};
+	while (i < src.length) {
+		const c = src[i];
+		if (c === " " || c === "\t") { i++; continue; }
+		if (c === "\\" && src[i + 1] === "\n") { i += 2; continue; }
+		if (c === "#") { while (i < src.length && src[i] !== "\n") i++; continue; }
+		if (c === "\n") {
+			finish("\n");
+			i++;
+			// Heredoc bodies are data, not commands.
+			for (const { delimiter, tabs } of heredocs.splice(0)) {
+				for (;;) {
+					if (i >= src.length) return undefined;
+					const lineEnd = src.indexOf("\n", i) < 0 ? src.length : src.indexOf("\n", i);
+					const line = src.slice(i, lineEnd);
+					i = Math.min(lineEnd + 1, src.length);
+					if ((tabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+				}
+			}
+			continue;
+		}
+		const two = src.slice(i, i + 2);
+		if (two === "&&" || two === "||" || two === ";;" || two === "|&") { finish(two); i += 2; continue; }
+		if (c === ";" || c === "|" || (c === "&" && src[i + 1] !== ">")) { finish(c); i++; continue; }
+		const group = c === "(" || c === ")" || ((c === "{" || c === "}") && /^[\s;]?$/.test(src[i + 1] ?? ""));
+		if (group) {
+			finish(c);
+			depth += c === "(" || c === "{" ? 1 : -1;
+			if (depth < 0) return undefined;
+			commands.push({ start: i, end: i, words: [], depth, next: "group" });
+			i++;
+			continue;
+		}
+		if (start < 0) start = i;
+		if (c === "<" || c === ">" || c === "&") {
+			if (!readRedirect()) return undefined;
+		} else {
+			const word = readWord();
+			if (!word) return undefined;
+			// `2>/dev/null`: the digits name a file descriptor.
+			if (/^\d+$/.test(word.text) && (src[i] === "<" || src[i] === ">")) {
+				if (!readRedirect()) return undefined;
+			} else words.push(word);
+		}
+		end = i;
+	}
+	finish("");
+	return depth === 0 && heredocs.length === 0 ? commands : undefined;
+}
+
+// A literal path from a word, or undefined when the shell could change it.
+function wordPath(word: ShellWord, cwd: string | undefined, home: string): string | undefined {
+	if (!word.literal || !word.text || word.text.startsWith("-")) return undefined;
+	let text = word.text;
+	if (word.tilde) {
+		if (text !== "~" && !text.startsWith("~/")) return undefined;
+		text = home + text.slice(1);
+	}
+	// `..` can climb out through a symlink, which a text check cannot follow.
+	if (text.split("/").includes("..")) return undefined;
+	if (isAbsolute(text)) return resolve(text);
+	return cwd ? resolve(cwd, text) : undefined;
+}
+
+function throwawayTarget(word: ShellWord, cwd: string | undefined, files: GuardFiles): boolean {
+	if (word.glob >= 0) {
+		// Only the last part may be a pattern: `a*/b` can go through a symlink.
+		const slash = word.text.lastIndexOf("/");
+		if (slash > word.glob) return false;
+		const dir = wordPath({ ...word, text: slash < 0 ? "." : word.text.slice(0, slash) || "/", glob: -1 }, cwd, files.home);
+		if (!dir) return false;
+		const real = files.real(dir);
+		// `/tmp/*`, `/tmp/.*`, and `/tmp/[a-z]*` would empty the whole temp folder;
+		// `/tmp/dbg*.mjs` names its files.
+		return files.throwaway(real) || (files.tempRoot(real) && /[^*?.]/.test(word.text.slice(slash + 1).replace(/\[[^\]]*\]?/g, "")));
+	}
+	const path = wordPath(word, cwd, files.home);
+	if (!path) return false;
+	// rm deletes a symlink itself, not what it points to, unless the name ends in a slash.
+	return files.throwaway(word.text.endsWith("/") ? files.real(path) : join(files.real(dirname(path)), basename(path)));
+}
+
+function throwawayDelete(words: ShellWord[], cwd: string | undefined, files: GuardFiles): boolean {
+	const [program, ...args] = words;
+	if (!program.literal || program.glob >= 0 || !DELETERS.has(program.text.split("/").pop()!)) return false;
+	const targets: ShellWord[] = [];
+	let options = true;
+	for (const word of args) {
+		if (options && word.text === "--") options = false;
+		else if (!(options && word.literal && /^-./.test(word.text))) targets.push(word);
+	}
+	return targets.length > 0 && targets.every(word => throwawayTarget(word, cwd, files));
+}
+
+// The folder after this command, or undefined when it is not known for certain.
+// A `cd` counts only when it runs every time (first in its list), names one
+// literal folder that exists, and the next command depends on it or follows it.
+function nextCwd(command: ShellCommand, cwd: string | undefined, previous: string, files: GuardFiles): string | undefined {
+	const [first, ...rest] = command.words;
+	const changes = command.words.some(word => CWD_CHANGERS.test(word.text)) || first.text === "source" || first.text === ".";
+	if (!changes) return cwd;
+	if (command.depth > 0 || first.text !== "cd" || !first.literal || rest.length > 1) return undefined;
+	if (!["", ";", "\n"].includes(previous) || !["&&", ";", "\n", ""].includes(command.next)) return undefined;
+	// CDPATH can send a relative `cd` somewhere else.
+	if (rest[0] && !isAbsolute(rest[0].text) && !rest[0].tilde && process.env.CDPATH) return undefined;
+	const target = rest[0] ? (rest[0].glob < 0 ? wordPath(rest[0], cwd, files.home) : undefined) : files.home;
+	return target && files.isDirectory(target) ? target : undefined;
+}
+
+/** The command with each throwaway delete replaced by `true`. */
+function withoutThrowawayDeletes(command: string, files: GuardFiles): string {
+	const commands = parseShell(command);
+	if (!commands) return command;
+	const spans: [number, number][] = [];
+	let cwd: string | undefined = files.cwd;
+	let previous = "";
+	for (const cmd of commands) {
+		if (!cmd.words.length) {
+			// After a bracket, the folder depends on what ran inside it.
+			cwd = undefined;
+			previous = cmd.next;
+			continue;
+		}
+		if (cmd.depth === 0 && throwawayDelete(cmd.words, cwd, files)) spans.push([cmd.start, cmd.end]);
+		cwd = nextCwd(cmd, cwd, previous, files);
+		previous = cmd.next;
+	}
+	for (const [start, end] of spans.reverse()) command = command.slice(0, start) + "true" + command.slice(end);
+	return command;
+}
+
+function isGuardConfig(path: string): boolean {
+	return basename(path) === GUARD_CONFIG && basename(dirname(path)) === ".pi";
+}
+
+// Folders that `.pi/apple-pi.json` lists under "throwaway", relative to the project.
+function configuredThrowaway(top: string): string[] {
+	try {
+		const folders: unknown = JSON.parse(readFileSync(join(top, ".pi", GUARD_CONFIG), "utf8"))?.throwaway;
+		if (!Array.isArray(folders)) return [];
+		return folders.filter((folder): folder is string => typeof folder === "string")
+			.map(folder => normalize(folder).replace(/[\\/]+$/, ""))
+			.filter(folder => folder && folder !== "." && !isAbsolute(folder) && !folder.split(sep).includes(".."));
+	} catch {
+		return [];
+	}
+}
+
+function defaultTempRoots(home: string): string[] {
+	return ["/tmp", tmpdir(), process.env.TMPDIR, join(home, "Library", "Caches"), join(home, ".cache"), process.env.XDG_CACHE_HOME]
+		.filter((root): root is string => !!root);
+}
+
+/** The guard's view of real files, for a shell running in `cwd`. */
+export function throwawayFiles(cwd: string, created: ReadonlySet<string>, roots?: string[]): GuardFiles {
+	const home = homedir();
+	const isDirectory = (path: string) => { try { return statSync(path).isDirectory(); } catch { return false; } };
+	const real = (path: string): string => {
+		const rest: string[] = [];
+		for (let dir = path; ; dir = dirname(dir)) {
+			try { return join(realpathSync(dir), ...rest); } catch {}
+			if (dirname(dir) === dir) return path;
+			rest.unshift(basename(dir));
+		}
+	};
+	const inside = (root: string, path: string) => {
+		const rel = relative(root, path);
+		return !!rel && !rel.startsWith("..") && !isAbsolute(rel);
+	};
+	// A TMPDIR or XDG_CACHE_HOME set to home or above it would make everything throwaway.
+	const realHome = real(home);
+	const temp = [...new Set((roots ?? defaultTempRoots(home)).map(root => real(resolve(root))))]
+		.filter(root => root !== realHome && !inside(root, realHome) && dirname(root) !== root);
+	const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 });
+	return {
+		cwd, home, real, isDirectory,
+		tempRoot: path => temp.includes(path),
+		throwaway(path) {
+			if (created.has(path) || temp.some(root => inside(root, path))) return true;
+			try {
+				let dir = path;
+				while (!isDirectory(dir)) dir = dirname(dir);
+				const top = real(git(dir, ["rev-parse", "--show-toplevel"]).trim());
+				if (!inside(top, path)) return false;
+				const rel = relative(top, path);
+				// Only a config the user made here counts: a tracked one can come from
+				// a cloned project and would let it mark files such as `.env` throwaway.
+				const listed = () => git(top, ["ls-files", "--", join(".pi", GUARD_CONFIG)]) === ""
+					&& configuredThrowaway(top).some(folder => rel === folder || rel.startsWith(folder + sep));
+				if (!rel.split(sep).some(part => SCRATCH_NAME.test(part)) && !listed()) return false;
+				// Git must ignore it, and nothing in it may be tracked: tracked files can
+				// hold edits that were never committed. check-ignore fails when not ignored.
+				git(top, ["check-ignore", "-q", "--", rel]);
+				// A literal pathspec: a file named `a*b` is not a pattern.
+				return git(top, ["--literal-pathspecs", "ls-files", "--", rel]) === "";
+			} catch {
+				return false;
+			}
+		},
+	};
+}
+
 /** Why a shell command needs the user's permission, or undefined when it does not. */
-export function destructiveReason(command: string): string | undefined {
+export function destructiveReason(command: string, files?: GuardFiles): string | undefined {
+	// The config decides what runs unasked, so changing it asks.
+	if (command.includes(GUARD_CONFIG)) return CONFIG_CHANGE;
+	const reason = commandReason(command);
+	return reason && files ? commandReason(withoutThrowawayDeletes(command, files)) : reason;
+}
+
+function commandReason(command: string): string | undefined {
 	// Name targets only for simple literal rm commands. Do not guess at shell
 	// expansions, quoted paths, scripts, or commands joined with separators.
 	if (/^(?:\/\w+)*\/?rm(?:[ \t]+[\w./-]+)+$/.test(command.trim())) {
@@ -884,6 +1239,8 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 	// Bumped on shutdown: questions queued by an old session must not open in
 	// its replacement, and shutdown cancels whatever is still waiting.
 	let generation = 0;
+	// Real paths of files that the write tool created this session.
+	const created = new Set<string>();
 
 	function pump(): void {
 		if (active || waiting.length === 0) return;
@@ -903,6 +1260,7 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", () => {
 		generation++;
+		created.clear();
 		for (const job of waiting.splice(0)) {
 			job.dispose();
 			job.settle(job.declined);
@@ -917,9 +1275,24 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		if (!SHELL_TOOLS.has(event.toolName)) return undefined;
-		const command = String((event.input as { command?: unknown }).command ?? "");
-		const reason = destructiveReason(command);
+		let command: string;
+		let reason: string | undefined;
+		if (SHELL_TOOLS.has(event.toolName)) {
+			command = String((event.input as { command?: unknown }).command ?? "");
+			// The throwaway parser reads POSIX shell. PowerShell quotes and lists
+			// differently (`rm /tmp/a,~/b` is two paths), so it always asks.
+			reason = destructiveReason(command, ctx.cwd && event.toolName === "bash" ? throwawayFiles(ctx.cwd, created) : undefined);
+		} else if ((event.toolName === "write" || event.toolName === "edit") && ctx.cwd) {
+			// Pi's own path rules: an `@` prefix is dropped and `~` is home.
+			const given = String((event.input as { path?: unknown }).path ?? "").replace(/^@/, "");
+			const path = resolve(ctx.cwd, given === "~" || given.startsWith("~/") ? homedir() + given.slice(1) : given);
+			const files = throwawayFiles(ctx.cwd, created);
+			// A file the agent writes new is its own, so it may delete it unasked.
+			if (event.toolName === "write" && !existsSync(path)) created.add(files.real(path));
+			if (!isGuardConfig(files.real(path))) return undefined;
+			command = `${event.toolName} ${given}`;
+			reason = CONFIG_CHANGE;
+		} else return undefined;
 		if (!reason) return undefined;
 		const declined = { block: true as const, reason: `Command stopped. ${reason} Permission was not given. Do not try another way to run it. Ask the user first.` };
 		// Print and JSON runs have nobody to ask.

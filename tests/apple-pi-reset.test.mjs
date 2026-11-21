@@ -3,6 +3,7 @@
 // Pi is found through `pnpm root -g` and `npm root -g`, or set PI_PACKAGE_DIR.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import * as realFs from "node:fs";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -46,7 +47,10 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 		require(name) {
 			if (name === "@earendil-works/pi-coding-agent") return piModule;
 			if (name === "@earendil-works/pi-tui") return tui;
+			if (name === "node:child_process") return requirePi(name);
 			if (name === "node:fs") return {
+				// The guard's throwaway checks look at real files.
+				existsSync: realFs.existsSync, realpathSync: realFs.realpathSync, statSync: realFs.statSync,
 				readFileSync: path => {
 					fileReads.push(path);
 					if (state.files && Object.hasOwn(state.files, path)) {
@@ -63,7 +67,7 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 					throw new Error("ENOENT");
 				},
 			};
-			if (name === "node:os") return { homedir: () => "/mock-home" };
+			if (name === "node:os") return { homedir: () => "/mock-home", tmpdir: () => "/mock-tmp" };
 			if (name === "node:path") return requirePi(name);
 			throw new Error(`Unexpected import: ${name}`);
 		},
@@ -1567,7 +1571,129 @@ test("guard: ordinary commands, run-once tools, recoverable changes, and words i
 	]) assert.equal(destructiveReason(command), undefined, command);
 });
 
-function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false, select } = {}) {
+// A project at /proj whose verify-scratch folder is throwaway, a temp folder at
+// /tmp, and folders that exist for `cd`.
+const fakeFiles = (overrides = {}) => ({
+	cwd: "/proj", home: "/home/me",
+	real: path => path,
+	isDirectory: path => ["/proj", "/proj/verify-scratch/sub", "/tmp", "/home/me"].includes(path),
+	throwaway: path => /^\/tmp\/./.test(path) || /^\/proj\/verify-scratch(\/|$)/.test(path) || /^\/home\/me\/\.cache\/./.test(path),
+	tempRoot: path => path === "/tmp" || path === "/home/me/.cache",
+	...overrides,
+});
+
+test("guard: deletes of throwaway files run unasked", () => {
+	const { destructiveReason } = loadExtension();
+	for (const command of [
+		"rm /tmp/dbg.mjs", "cd /proj && rm /tmp/dbg.mjs /tmp/shot.png", "rm -f /tmp/x 2>/dev/null", 'rm "/tmp/Screenshot 1.png"', "unlink /tmp/x",
+		"/bin/rm -rf /tmp/run-1", "rm -- /tmp/x", "rm ~/.cache/x", "rm /tmp/dbg*.mjs", "rm -rf verify-scratch", "rm -rf ./verify-scratch/commit-split",
+		"cd /proj && rm -f verify-scratch/*.png && node check.mjs 2>&1 | tail -20",
+		"cd /proj/verify-scratch/sub\nrm -f replay.diff.header replay.diff.hunk*\nfor f in a b; do awk '{print > fn}' $f.diff; done",
+		// Heredoc bodies are data, even with quotes and brackets in them.
+		"rm /tmp/a.mjs; cat > /tmp/b.mjs <<'EOF'\nconst x = `${a}` + 'it\\'s' + \"(\";\nEOF\nnode /tmp/b.mjs",
+		"pnpm build > /tmp/b.log 2>&1; echo \"exit: $?\"; rm /tmp/b.log && for f in a b; do n=$(grep -c x \"$f\" || true); echo \"$f: $n\"; done",
+		"cd /proj && tail -3 verify-scratch/dev.log && rm verify-scratch/dev.log && git diff --stat",
+	]) assert.equal(destructiveReason(command, fakeFiles()), undefined, command);
+});
+
+test("guard: deletes that might reach past throwaway files still ask", () => {
+	const { destructiveReason } = loadExtension();
+	for (const command of [
+		// Not throwaway, or only partly.
+		"rm src/app.ts", "rm /tmp/x src/app.ts", "rm -rf /tmp", "rm -rf /tmp/", "rm -rf /tmp/*", "rm -rf ~/.cache/*", "rm -rf verify-scratch/../src",
+		"rm -rf /tmp/x*/", "rm -rf verify-scratch/*/x", "rm {/tmp/a,src}", "rm ~bob/x", "rm -f",
+		"rm -rf /tmp/.*", "rm -rf /tmp/[a-z]*", "rm -rf /tmp/?*", "rm -rf ~\"/.cache/x\"",
+		// What the shell would delete is not known from the text.
+		"rm $OUT", "rm /tmp/$(whoami)", "rm \"/tmp/$X\"", "rm `cat list`",
+		// The folder is not known for certain.
+		"cd /gone; rm -rf verify-scratch/x", "cd /gone && rm verify-scratch/x", "false || cd /proj && rm verify-scratch/x",
+		"cd /tmp | rm verify-scratch/x", "eval \"cd /src\"; rm -rf verify-scratch", "source env.sh; rm -rf verify-scratch",
+		"(cd /src) ; rm -rf verify-scratch", "pushd /src; rm -rf verify-scratch", "cd $DIR && rm -rf verify-scratch",
+		// Nested deletes are left to the text check.
+		"bash -c 'cd /tmp && rm -rf y'", "(rm /tmp/x)", "if true; then rm /tmp/x; fi", "sudo rm /tmp/x", "find /tmp/x -delete",
+		// Other parts still ask, and text the parser cannot read asks as before.
+		"rm /tmp/x && npm install", "rm /tmp/x\nrm src/a", "rm /tmp/x 'unclosed", "cat <<EOF\nrm src/a",
+		// The config decides what is throwaway.
+		"echo '{}' > .pi/apple-pi.json", "cp /tmp/x .pi/apple-pi.json",
+	]) assert.ok(destructiveReason(command, fakeFiles()), command);
+	assert.equal(destructiveReason("rm /tmp/x && rm src/app.ts", fakeFiles()), "Deletes files or folders. They do not go to the Trash, so you cannot get them back.");
+	// A relative path needs a folder that CDPATH cannot redirect.
+	assert.ok(destructiveReason("cd sub && rm x", fakeFiles({ isDirectory: () => true, throwaway: path => path === "/proj/sub/x" })) === undefined);
+});
+
+test("guard: real files: ignored scratch folders, configured folders, and new files from write", () => {
+	const root = realpathSync(realFs.mkdtempSync(join(realpathSync(fileURLToPath(new URL(".", import.meta.url))), ".guard-")));
+	try {
+		const sh = (...args) => execFileSync("git", ["-C", root, ...args], { stdio: "ignore" });
+		const write = (path, text = "x") => { realFs.mkdirSync(join(root, path, ".."), { recursive: true }); realFs.writeFileSync(join(root, path), text); };
+		sh("init", "-q");
+		write(".gitignore", "/verify-evidence/\n/out-scratch/\n/tasks\n/exports/\n");
+		for (const path of ["verify-evidence/f-35/a.png", "verify-evidence/f-35/requests.json", "out-scratch/x.mjs", "tasks/context.md", "exports/survey.csv", "src/app.ts", "src/tmp/kept.ts", "forced-scratch/keep"]) write(path);
+		write("forced-scratch/.gitignore", "*\n");
+		sh("add", ".gitignore", "src/app.ts", "src/tmp/kept.ts");
+		sh("add", "-f", "forced-scratch/keep");
+		realFs.symlinkSync(join(root, "src"), join(root, "verify-evidence", "link"));
+		const config = join(root, ".pi", "apple-pi.json");
+		const { destructiveReason, throwawayFiles } = loadExtension({}, { status: 200, files: { [config]: { throwaway: ["verify-evidence/", "../outside", "/abs"] } } });
+		const created = new Set([join(root, "src", "fixture.test.ts")]);
+		const files = throwawayFiles(root, created, ["/mock-tmp"]);
+		for (const command of [
+			"rm -f verify-evidence/f-35/*.png", "rm -f verify-evidence/f-35/*", "rm -rf out-scratch", "rm out-scratch/x.mjs",
+			"rm verify-evidence/link", "rm src/fixture.test.ts", `rm ${join(root, "verify-evidence", "f-35", "requests.json")}`,
+		]) assert.equal(destructiveReason(command, files), undefined, command);
+		for (const command of [
+			// Ignored, but neither scratch-named nor configured.
+			"rm tasks/context.md", "rm -rf exports",
+			// Tracked, even inside an ignored or scratch-named folder.
+			"rm src/app.ts", "rm -rf src/tmp", "rm -rf forced-scratch",
+			// The symlink's target, not the link.
+			"rm -rf verify-evidence/link/", "rm verify-evidence/link/app.ts",
+		]) assert.ok(destructiveReason(command, files), command);
+		// A config that git tracks can come from a cloned project, so it does not count.
+		write(".pi/apple-pi.json", "{}");
+		sh("add", ".pi/apple-pi.json");
+		assert.ok(destructiveReason("rm -f verify-evidence/f-35/*.png", files));
+		assert.equal(destructiveReason("rm -rf out-scratch", files), undefined);
+	} finally {
+		realFs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("guard: a temp or cache setting that points at home or the root is not a temp folder", () => {
+	const { destructiveReason, throwawayFiles } = loadExtension();
+	const files = throwawayFiles("/", new Set(), ["/mock-home", "/", "/mock-home/.cache"]);
+	assert.ok(destructiveReason("rm -rf /mock-home/notes", files));
+	assert.ok(destructiveReason("rm -rf /etc/x", files));
+	assert.equal(destructiveReason("rm -rf /mock-home/.cache/x", files), undefined);
+});
+
+test("guard: a file that write creates may be deleted unasked; the guard config asks before it changes", async () => {
+	const root = realpathSync(realFs.mkdtempSync(join(realpathSync(fileURLToPath(new URL(".", import.meta.url))), ".guard-")));
+	try {
+		realFs.writeFileSync(join(root, "old.ts"), "x");
+		const run = guardRun({ answer: "No", cwd: root });
+		assert.equal(await run.call("write", { path: "src/new.test.ts", content: "x" }), undefined);
+		assert.equal(await run.call("write", { path: "old.ts", content: "y" }), undefined);
+		assert.equal(await run.call("bash", { command: "rm src/new.test.ts" }), undefined);
+		assert.equal((await run.call("bash", { command: "rm old.ts" })).block, true);
+		assert.equal((await run.call("edit", { path: ".pi/apple-pi.json", edits: [] })).block, true);
+		assert.equal((await run.call("write", { path: "@.pi/apple-pi.json", content: "{}" })).block, true);
+		assert.equal(run.asked.length, 3);
+		assert.match(run.asked[1][0], /Command:\nedit \.pi\/apple-pi\.json$/);
+		// PowerShell lists and quotes differently, so its deletes always ask.
+		assert.equal(await run.call("write", { path: "made.ps1", content: "x" }), undefined);
+		assert.equal((await run.call("powershell", { command: "rm made.ps1" })).block, true);
+		assert.equal(await run.call("bash", { command: "rm made.ps1" }), undefined);
+		// A new session starts with no files of its own.
+		await run.shutdown();
+		const next = guardRun({ answer: "No", cwd: root });
+		assert.equal((await next.call("bash", { command: "rm src/new.test.ts" })).block, true);
+	} finally {
+		realFs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false, select, cwd } = {}) {
 	const extension = loadExtension({}, { status: 200 }, clock);
 	const handlers = new Map();
 	const signals = [];
@@ -1605,7 +1731,7 @@ function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputErro
 		return promise;
 	};
 	const ctxFor = callSignal => ({
-		hasUI, model, signal: callSignal ?? signal,
+		hasUI, model, cwd, signal: callSignal ?? signal,
 		modelRegistry: {
 			streamSimple: (selected, context, options) => {
 				summaries.push({ selected, context, options });

@@ -10,7 +10,7 @@ A UI and workflow extension for [Pi](https://github.com/earendil-works/pi). It a
 - A **previous message** button above the fullscreen editor.
 - Fullscreen copy that joins transcript-wrapped lines while keeping intentional line breaks. In Herdr, selected text goes to the clipboard of the computer viewing the chat, including remote chats. No setting is needed.
 - Automatic continuation after a subscription usage limit resets, with messages added while waiting included on resume. No settings or enable command.
-- A permission question before shell commands that can lose work for good or reach past the project: deleting files or discarding work, installing or updating software or packages that stay installed, or pushing to a remote, such as `rm`, `git reset --hard`, `npm install`, or `git push`. Run-once tools such as `npx` do not ask. See [Destructive commands](#destructive-commands).
+- A permission question before shell commands that can lose work for good or reach past the project: deleting files or discarding work, installing or updating software or packages that stay installed, or pushing to a remote, such as `rm`, `git reset --hard`, `npm install`, or `git push`. Run-once tools such as `npx` do not ask, and neither do deletes of throwaway files: temp and cache files, ignored scratch folders, and new files that the agent wrote. See [Destructive commands](#destructive-commands).
 
 Reset times use the computer's local time zone and a 24-hour clock:
 
@@ -131,6 +131,24 @@ Pi runs tool calls without asking. apple-pi asks you first when a `bash` or `pow
 
 Commands that change things you can easily restore run without a question: `rmdir` without `-Recurse` or `/s` (only empty folders), `git tag -d`, `git reset --keep`, `git rm` without `-f` (Git refuses to delete uncommitted changes), `git worktree prune`, `rsync --remove-source-files`, `docker rmi`, and `docker image …`. Every `git push` asks, including `--force-with-lease` (it is still a push to the shared remote). `sudo` and `doas` do not ask by themselves; the guard checks the command they run, so `sudo rm -rf /opt/x` and `sudo apt install jq` still ask.
 
+### Throwaway files
+
+An `rm` or `unlink` in the `bash` tool runs without a question when every file or folder that it names is throwaway. PowerShell quotes and lists paths differently (`rm /tmp/a,~/b` deletes two paths), so its deletes always ask.
+
+- inside a temp or cache folder: `/tmp`, the system temp folder (`$TMPDIR`), `~/Library/Caches`, `~/.cache`, or `$XDG_CACHE_HOME`. The folder itself, and a pattern that matches almost everything in it, such as `rm -rf /tmp/*`, `/tmp/.*`, or `/tmp/[a-z]*`, still ask, because other programs keep files there too. A `TMPDIR` or `XDG_CACHE_HOME` set to your home folder or `/` is not used. A pattern with a name in it, such as `rm /tmp/dbg*.mjs`, does not ask;
+- in a project folder that Git ignores and that has a scratch-style name: `scratch`, `tmp`, `temp`, or `cache`, alone or at the end of a name, such as `verify-scratch` or `.cache`;
+- in a project folder that Git ignores and that you list in the project's `.pi/apple-pi.json`, for folders without such a name, such as a folder of screenshots. The file counts only while Git does not track it, so a project you clone cannot mark files such as `.env` throwaway; keep it uncommitted:
+
+  ```json
+  { "throwaway": ["verify-evidence"] }
+  ```
+
+- a new file that the agent made with the `write` tool in this session, such as a test fixture it deletes after one run.
+
+A folder that Git ignores is not enough by itself: projects also ignore `.env`, notes, and exports that you cannot get back. A file that Git tracks always asks, even inside a scratch folder, because it can hold edits that you have not committed. Changing `.pi/apple-pi.json` with `write`, `edit`, or a shell command that names `apple-pi.json` asks first, because the file decides what runs unasked. A command that only reads it, such as `cat .pi/apple-pi.json`, asks too.
+
+The guard reads the command as shell text to find the files. Anything that it cannot read for certain asks as before: variables (`rm "$OUT"`), `$( … )`, `..` in a path, a pattern in a folder name (`a/*/b`), a trailing `/` after a symlink that leads out, and deletes inside brackets, `bash -c`, `if`, loops, or `sudo`. It follows `cd` to a written-out folder that exists, so `cd ~/project && rm -f verify-scratch/*.png` does not ask. A `cd` that might not run, such as after `||`, or that uses a variable makes later relative paths unknown, so they ask. Other parts of the same command are still checked: `rm /tmp/x && npm install` asks for the install.
+
 Run-once tools also run without a question, because they keep the package only in a cache and do not add it to the project or the computer: `npx`, `npm exec`/`x`, `npm init`/`create`, `pnpm dlx`/`create`, `pnpx`, `yarn dlx`, `bunx`, `bun x`/`create`, `uvx`, `uv tool run`, and `pipx run`. The package's own code still runs. The guard checks the command that `npx`, `pnpx`, `bunx`, or `uvx` runs, so `npx pnpm install` still asks.
 
 The check also looks inside `bash -c`, `eval`, `xargs`, `$( … )`, subshells, and chained commands. It checks commands after wrappers such as `sudo`, `timeout`, `nice`, `env`, `watch`, and `npx`, including their common options. Codemode scripts call tools through the same check.
@@ -141,7 +159,7 @@ Each summary adds one model request through Pi's configured model and authentica
 
 The summary request has a 15-second limit. Missing models, failed requests, incomplete or empty responses, and commands over 16,000 characters show the guard's reason for asking and a note that no summary is available, beside the full command. The guard does not show a guessed or partial summary instead. Cancelling the agent stops the command. Print and JSON runs block without making a summary request.
 
-This check cannot find every command that can cause data loss or an unwanted install. It reads text; it does not fully parse shell syntax or all command options. It is not a sandbox: a script or build command that deletes files (`npm run clean`, `make clean`) or installs packages (`make install`, `python -m pip install`), even a script named after an install (`npm run install`), and an install script saved first and run later (`curl -o get.sh … && sh get.sh`) run without a question, as do `mv` or `cp` over an existing file, a `>` redirect, and the `write` and `edit` tools. List refreshes (`apt update`, `brew update`, `pacman -Sy`, and `scoop update` without an app), read-only checks (`npm outdated`, and `winget upgrade` without an app, which only lists upgrades), a `git push --dry-run` (it only shows what it would send), `uv run`, even with `--with` (it installs only what the project lists, and keeps `--with` packages in a cache), and versioned names (`pip3.12`) run unasked. For real limits, run Pi in a sandbox or container; see Pi's `docs/security.md`. A command that only mentions one of these words in quotes, such as `grep "rm -rf"`, can ask once more than needed.
+This check cannot find every command that can cause data loss or an unwanted install. It reads text; it does not fully parse shell syntax or all command options. It is not a sandbox: a script or build command that deletes files (`npm run clean`, `make clean`) or installs packages (`make install`, `python -m pip install`), even a script named after an install (`npm run install`), and an install script saved first and run later (`curl -o get.sh … && sh get.sh`) run without a question, as do `mv` or `cp` over an existing file, a `>` redirect, and the `write` and `edit` tools (except on `.pi/apple-pi.json`). List refreshes (`apt update`, `brew update`, `pacman -Sy`, and `scoop update` without an app), read-only checks (`npm outdated`, and `winget upgrade` without an app, which only lists upgrades), a `git push --dry-run` (it only shows what it would send), `uv run`, even with `--with` (it installs only what the project lists, and keeps `--with` packages in a cache), and versioned names (`pip3.12`) run unasked. For real limits, run Pi in a sandbox or container; see Pi's `docs/security.md`. A command that only mentions one of these words in quotes, such as `grep "rm -rf"`, can ask once more than needed.
 
 ## Usage and checks
 
