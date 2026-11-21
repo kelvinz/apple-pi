@@ -49,7 +49,7 @@ import type { ExtensionAPI, ExtensionContext, MessageEndEvent, ReadonlyFooterDat
 import { getAgentDir, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -813,7 +813,12 @@ export type GuardFiles = {
 	throwaway: (path: string) => boolean;
 	/** True for a temp or cache folder itself, whose entries are all throwaway. */
 	tempRoot: (path: string) => boolean;
+	/** The outermost git-ignored project folder that holds this real path, when nothing in it is tracked. */
+	ignoredFolder?: (path: string) => IgnoredFolder | undefined;
 };
+
+/** A project folder, relative to the project's real top folder. */
+export type IgnoredFolder = { top: string; folder: string };
 
 // `glob` is where the first unquoted `*`, `?`, or `[` is in `text`, or -1.
 // `literal` is false when the shell would change the word: variables, command
@@ -1081,15 +1086,34 @@ function isGuardConfig(path: string, real: (path: string) => string): boolean {
 	return path === real(join(getAgentDir(), GUARD_CONFIG));
 }
 
+// The config's projects, `{}` when there is no file yet, or undefined when it
+// cannot be read as `{ "throwaway": { "<project>": [...] } }`.
+function readGuardConfig(): { throwaway: Record<string, unknown> } | undefined {
+	const path = join(getAgentDir(), GUARD_CONFIG);
+	if (!existsSync(path)) return { throwaway: {} };
+	try {
+		const config: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!config || typeof config !== "object" || Array.isArray(config)) return undefined;
+		const projects = (config as { throwaway?: unknown }).throwaway ?? {};
+		if (!projects || typeof projects !== "object" || Array.isArray(projects)) return undefined;
+		return { ...config, throwaway: projects as Record<string, unknown> };
+	} catch {
+		return undefined;
+	}
+}
+
+// The config's key for the project at `top`: an absolute folder or one starting with `~/`.
+function projectKey(key: string, top: string, real: (path: string) => string): boolean {
+	return (isAbsolute(key) || key === "~" || key.startsWith("~/")) && real(piPath("/", key)) === top;
+}
+
 // Folders that the config lists under "throwaway" for the project at `top`,
-// relative to it. Each key is a project folder, absolute or starting with `~/`.
+// relative to it.
 function configuredThrowaway(top: string, real: (path: string) => string): string[] {
 	try {
-		const projects: unknown = JSON.parse(readFileSync(join(getAgentDir(), GUARD_CONFIG), "utf8"))?.throwaway;
-		if (!projects || typeof projects !== "object" || Array.isArray(projects)) return [];
+		const projects = readGuardConfig()?.throwaway ?? {};
 		const folders = Object.entries(projects)
-			.filter(([project, list]) => Array.isArray(list) && (isAbsolute(project) || project === "~" || project.startsWith("~/"))
-				&& real(piPath("/", project)) === top)
+			.filter(([project, list]) => Array.isArray(list) && projectKey(project, top, real))
 			.flatMap(([, list]) => list as unknown[]);
 		return folders.filter((folder): folder is string => typeof folder === "string")
 			.map(folder => normalize(folder).replace(/[\\/]+$/, ""))
@@ -1102,6 +1126,24 @@ function configuredThrowaway(top: string, real: (path: string) => string): strin
 function defaultTempRoots(home: string): string[] {
 	return ["/tmp", tmpdir(), process.env.TMPDIR, join(home, "Library", "Caches"), join(home, ".cache"), process.env.XDG_CACHE_HOME]
 		.filter((root): root is string => !!root);
+}
+
+/** Lists these folders in the config, keeping what is already there. Throws when it cannot. */
+function addThrowaway(folders: IgnoredFolder[], files: GuardFiles): void {
+	const config = readGuardConfig();
+	if (!config) throw new Error("unreadable config");
+	const realHome = files.real(files.home);
+	for (const { top, folder } of folders) {
+		const rel = relative(realHome, top);
+		const key = Object.keys(config.throwaway).find(key => projectKey(key, top, files.real))
+			?? (rel && !rel.startsWith("..") && !isAbsolute(rel) ? `~/${rel.split(sep).join("/")}` : top);
+		const list = Array.isArray(config.throwaway[key]) ? config.throwaway[key] as unknown[] : [];
+		const name = folder.split(sep).join("/");
+		if (!list.includes(name)) config.throwaway[key] = [...list, name];
+	}
+	const path = join(getAgentDir(), GUARD_CONFIG);
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, JSON.stringify(config, null, "\t") + "\n");
 }
 
 /** The guard's view of real files, for a shell running in `cwd`. */
@@ -1125,15 +1167,34 @@ export function throwawayFiles(cwd: string, created: ReadonlySet<string>, roots?
 	const temp = [...new Set((roots ?? defaultTempRoots(home)).map(root => real(resolve(root))))]
 		.filter(root => root !== realHome && !inside(root, realHome) && dirname(root) !== root);
 	const git = (dir: string, args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 });
+	// The real top folder of the project that holds `path`. Throws outside a project.
+	const projectTop = (path: string) => {
+		let dir = path;
+		while (!isDirectory(dir)) dir = dirname(dir);
+		return real(git(dir, ["rev-parse", "--show-toplevel"]).trim());
+	};
 	return {
 		cwd, home, real, isDirectory,
 		tempRoot: path => temp.includes(path),
+		ignoredFolder(path) {
+			try {
+				const top = projectTop(path);
+				if (!inside(top, path)) return undefined;
+				const parts = relative(top, path).split(sep);
+				for (let i = 1; i <= parts.length; i++) {
+					const folder = parts.slice(0, i).join(sep);
+					// An ignored file such as `.env` is never offered, only folders.
+					if (!isDirectory(join(top, folder))) return undefined;
+					try { git(top, ["check-ignore", "-q", "--", folder]); } catch { continue; }
+					return git(top, ["--literal-pathspecs", "ls-files", "--", folder]) === "" ? { top, folder } : undefined;
+				}
+			} catch {}
+			return undefined;
+		},
 		throwaway(path) {
 			if (created.has(path) || temp.some(root => inside(root, path))) return true;
 			try {
-				let dir = path;
-				while (!isDirectory(dir)) dir = dirname(dir);
-				const top = real(git(dir, ["rev-parse", "--show-toplevel"]).trim());
+				const top = projectTop(path);
 				if (!inside(top, path)) return false;
 				const rel = relative(top, path);
 				const listed = () => configuredThrowaway(top, real).some(folder => rel === folder || rel.startsWith(folder + sep));
@@ -1156,6 +1217,29 @@ export function destructiveReason(command: string, files?: GuardFiles): string |
 	if (command.includes(GUARD_CONFIG)) return CONFIG_CHANGE;
 	const reason = commandReason(command);
 	return reason && files ? commandReason(withoutThrowawayDeletes(command, files)) : reason;
+}
+
+/**
+ * Git-ignored project folders that, once listed in the config, would let this
+ * command run unasked, or undefined when listing folders would not be enough.
+ */
+export function throwawaySuggestion(command: string, files: GuardFiles): IgnoredFolder[] | undefined {
+	const ignoredFolder = files.ignoredFolder;
+	if (!ignoredFolder || command.includes(GUARD_CONFIG) || !readGuardConfig()) return undefined;
+	const found = new Map<string, IgnoredFolder>();
+	const widened: GuardFiles = {
+		...files,
+		throwaway(path) {
+			if (files.throwaway(path)) return true;
+			const folder = ignoredFolder(path);
+			if (folder) found.set(join(folder.top, folder.folder), folder);
+			return !!folder;
+		},
+	};
+	// Every delete that is not removed still asks, so `found` only holds
+	// folders from deletes that listing them would let through.
+	if (commandReason(withoutThrowawayDeletes(command, widened)) || !found.size) return undefined;
+	return [...found.values()];
 }
 
 function commandReason(command: string): string | undefined {
@@ -1287,15 +1371,17 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		let command: string;
 		let reason: string | undefined;
+		let files: GuardFiles | undefined;
 		if (SHELL_TOOLS.has(event.toolName)) {
 			command = String((event.input as { command?: unknown }).command ?? "");
 			// The throwaway parser reads POSIX shell. PowerShell quotes and lists
 			// differently (`rm /tmp/a,~/b` is two paths), so it always asks.
-			reason = destructiveReason(command, ctx.cwd && event.toolName === "bash" ? throwawayFiles(ctx.cwd, created) : undefined);
+			files = ctx.cwd && event.toolName === "bash" ? throwawayFiles(ctx.cwd, created) : undefined;
+			reason = destructiveReason(command, files);
 		} else if ((event.toolName === "write" || event.toolName === "edit") && ctx.cwd) {
 			const given = String((event.input as { path?: unknown }).path ?? "");
 			const path = piPath(ctx.cwd, given);
-			const files = throwawayFiles(ctx.cwd, created);
+			files = throwawayFiles(ctx.cwd, created);
 			// A file the agent writes new is its own, so it may delete it unasked.
 			if (event.toolName === "write" && !existsSync(path)) created.add(files.real(path));
 			if (!isGuardConfig(files.real(path), files.real)) return undefined;
@@ -1306,6 +1392,13 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 		const declined = { block: true as const, reason: `Command stopped. ${reason} Permission was not given. Do not try another way to run it. Ask the user first.` };
 		// Print and JSON runs have nobody to ask.
 		if (!ctx.hasUI) return declined;
+		// Deletes only in ignored folders can be allowed for good from the question.
+		const suggestion = files && throwawaySuggestion(command, files);
+		const remember = suggestion && files && `Yes, and don't ask again for ${suggestion.map(({ top, folder }) => {
+			const path = join(top, folder);
+			const rel = relative(files!.real(files!.cwd), path);
+			return (rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : path) + "/";
+		}).join(", ")}`;
 		// This run's signal, read once: the live ctx can point at a newer run by
 		// the time a queued question finally opens.
 		const signal = ctx.signal;
@@ -1331,9 +1424,18 @@ export function installDestructiveGuard(pi: ExtensionAPI): void {
 						const summary = await summarizeCommand(command, event.toolName, reason, ctx);
 						if (job.stale()) return declined;
 						const message = `Allow this command?\n\n${summary}\n\nCommand:\n${command}`;
-						const choice = await ctx.ui.select(message, ["Yes", "No", "Type a reply"], { signal });
+						const choice = await ctx.ui.select(message, remember ? ["Yes", remember, "No", "Type a reply"] : ["Yes", "No", "Type a reply"], { signal });
 						if (job.stale()) return declined;
 						if (choice === "Yes") return undefined;
+						if (remember && choice === remember) {
+							try {
+								addThrowaway(suggestion!, files!);
+							} catch {
+								// The user allowed the command; only remembering it failed.
+								try { ctx.ui.notify(`Could not save ${join(getAgentDir(), GUARD_CONFIG)}. apple-pi will ask again next time.`, "warning"); } catch {}
+							}
+							return undefined;
+						}
 						if (choice === "Type a reply") {
 							const reply = await ctx.ui.input("What should the agent do instead?", undefined, { signal });
 							if (reply?.trim()) return { block: true, reason: `${declined.reason}\n\nUser reply:\n${reply.trim()}` };

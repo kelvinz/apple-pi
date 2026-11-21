@@ -50,7 +50,11 @@ function loadExtension(responses = {}, state = { status: 200 }, clock = {}, env 
 			if (name === "node:child_process") return requirePi(name);
 			if (name === "node:fs") return {
 				// The guard's throwaway checks look at real files.
-				existsSync: realFs.existsSync, realpathSync: realFs.realpathSync, statSync: realFs.statSync,
+				existsSync: path => (state.files && Object.hasOwn(state.files, path)) || realFs.existsSync(path),
+				realpathSync: realFs.realpathSync, statSync: realFs.statSync,
+				// The guard saves its config here; tests read it back from `state.files`.
+				mkdirSync: () => {},
+				writeFileSync: (path, text) => { state.files = { ...state.files, [path]: text }; },
 				readFileSync: path => {
 					fileReads.push(path);
 					if (state.files && Object.hasOwn(state.files, path)) {
@@ -1691,8 +1695,44 @@ test("guard: a file that write creates may be deleted unasked; the guard config 
 	}
 });
 
-function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false, select, cwd } = {}) {
-	const extension = loadExtension({}, { status: 200 }, clock);
+test("guard: a delete in an ignored folder can be allowed for good, which lists the folder in the config", async () => {
+	const root = realpathSync(realFs.mkdtempSync(join(realpathSync(fileURLToPath(new URL(".", import.meta.url))), ".guard-")));
+	try {
+		const sh = (...args) => execFileSync("git", ["-C", root, ...args], { stdio: "ignore" });
+		const write = (path, text = "x") => { realFs.mkdirSync(join(root, path, ".."), { recursive: true }); realFs.writeFileSync(join(root, path), text); };
+		sh("init", "-q");
+		write(".gitignore", "/verify-evidence/\n/shots/\n/kept/\n.env\n");
+		for (const path of ["verify-evidence/f-35/a.png", "shots/b.png", "kept/notes.md", ".env", "src/app.ts"]) write(path);
+		sh("add", ".gitignore", "src/app.ts");
+		sh("add", "-f", "kept/notes.md");
+		const config = "/mock-agent/apple-pi.json";
+		const other = { throwaway: { "/other": ["out"] }, note: "kept" };
+		const choose = label => (title, options) => options.find(option => option.startsWith(label));
+		const run = guardRun({ cwd: root, select: choose("Yes, and"), state: { status: 200, files: { [config]: other } } });
+		assert.equal(await run.call("bash", { command: "rm verify-evidence/f-35/*.png && rm -rf shots" }), undefined);
+		assert.deepEqual(asPlain(run.asked[0][1]), ["Yes", "Yes, and don't ask again for verify-evidence/, shots/", "No", "Type a reply"]);
+		assert.deepEqual(JSON.parse(run.state.files[config]), { throwaway: { "/other": ["out"], [root]: ["verify-evidence", "shots"] }, note: "kept" });
+		// Next time it runs unasked.
+		assert.equal(await run.call("bash", { command: "rm -rf verify-evidence/f-35" }), undefined);
+		assert.equal(run.asked.length, 1);
+		// Not offered: an ignored file, a folder with tracked files, a tracked file, or another kind of risk.
+		for (const command of ["rm .env", "rm kept/notes.md", "rm src/app.ts", "rm -rf shots && npm install", "rm -rf shots ~/.pi/agent/apple-pi.json"]) {
+			const before = run.asked.length;
+			await run.call("bash", { command });
+			assert.deepEqual(asPlain(run.asked[before][1]), ["Yes", "No", "Type a reply"], command);
+		}
+		// A config that cannot be read is never overwritten, so it is not offered.
+		const broken = guardRun({ cwd: root, answer: "No", state: { status: 200, files: { [config]: "{ not json" } } });
+		await broken.call("bash", { command: "rm -rf verify-evidence" });
+		assert.deepEqual(asPlain(broken.asked[0][1]), ["Yes", "No", "Type a reply"]);
+		assert.equal(broken.state.files[config], "{ not json");
+	} finally {
+		realFs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputError, summary = "Delete the dist folder and its contents.", summaryError, stopReason = "stop", model = { id: "test-model" }, signal, clock = {}, pending = false, defer = false, select, cwd, state = { status: 200 } } = {}) {
+	const extension = loadExtension({}, state, clock);
 	const handlers = new Map();
 	const signals = [];
 	const asked = [];
@@ -1761,7 +1801,7 @@ function guardRun({ hasUI = true, answer = "Yes", confirmError, reply, inputErro
 	});
 	const ctx = ctxFor();
 	const call = (toolName, input, callSignal) => handlers.get("tool_call")({ toolName, input }, callSignal ? ctxFor(callSignal) : ctx);
-	return { call, signals, asked, summaries, dialogs, dialogEvents, shutdown: () => handlers.get("session_shutdown")({}, ctxFor()), maxOpen: () => maxOpenDialogs, openCount: () => openDialogs, current: () => dialogs.findLast(dialog => !dialog.closed) };
+	return { call, state, signals, asked, summaries, dialogs, dialogEvents, shutdown: () => handlers.get("session_shutdown")({}, ctxFor()), maxOpen: () => maxOpenDialogs, openCount: () => openDialogs, current: () => dialogs.findLast(dialog => !dialog.closed) };
 }
 
 test("guard: an allowed command runs and clears the blocked signal", async () => {
